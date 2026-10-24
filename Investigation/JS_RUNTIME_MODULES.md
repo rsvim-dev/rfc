@@ -4,7 +4,7 @@
 
 > 从 **数据结构、依赖图、引擎 API** 三个角度，分析五种 JavaScript runtime 如何解析、加载、链接和执行 module。
 >
-> 本文是在原有架构分析基础上的扩展：新增每个 runtime 的 module 注册表/缓存/树节点定义、V8/QuickJS 内置 API 调用清单、依赖库（crabuv / tokio / libuv）在 module 加载中的实际角色，以及可直接复现的运行验证。
+> 以 **static import、dynamic import、Node `require()`** 三种 API 为入口，区分加载策略、模块身份与缓存、引擎链接求值、API 与 Promise 桥接四层责任。包含核心数据结构、V8/QuickJS API、依赖库角色和可复现的运行验证。
 >
 > 分析日期：2026-10-24。
 
@@ -12,31 +12,276 @@
 
 ## 目录
 
+- [入门：CommonJS 与 ES modules 怎样工作](#入门commonjs-与-es-modules-怎样工作)
+  - [CommonJS：执行一个文件，拿回它交出来的值](#commonjs执行一个文件拿回它交出来的值)
+  - [ES modules：先接好导出的名字，再执行模块代码](#es-modules先接好导出的名字再执行模块代码)
+  - [Dynamic import：需要的时候再开始，完成后给你模块接口](#dynamic-import需要的时候再开始完成后给你模块接口)
+  - [缓存和循环依赖：为什么不能每次都重新执行文件](#缓存和循环依赖为什么不能每次都重新执行文件)
+  - [哪些是模块规则，哪些是 runtime 自己决定的](#哪些是模块规则哪些是-runtime-自己决定的)
 - [0. 分析范围、源码快照与验证方法](#0-分析范围源码快照与验证方法)
-- [1. 统一生命周期与三层责任](#1-统一生命周期与三层责任)
+  - [0.1 源码快照](#01-源码快照)
+  - [0.2 运行验证环境](#02-运行验证环境)
+  - [0.3 相关文档](#03-相关文档)
+- [1. 统一生命周期与四层责任](#1-统一生命周期与四层责任)
+  - [1.1 先区分加载图、语义图与 CJS 调用关系](#11-先区分加载图语义图与-cjs-调用关系)
+  - [1.2 三种 API 的合约](#12-三种-api-的合约)
+  - [1.3 五种 runtime 的分工](#13-五种-runtime-的分工)
 - [2. 引擎 API 合约：V8 与 QuickJS](#2-引擎-api-合约v8-与-quickjs)
+  - [2.1 V8：host 组织加载，引擎执行链接与求值](#21-v8host-组织加载引擎执行链接与求值)
+  - [2.2 QuickJS：engine 自己拥有 module 图](#22-quickjsengine-自己拥有-module-图)
+  - [2.3 两种合约的对照](#23-两种合约的对照)
 - [3. 数据结构与树形结构总览](#3-数据结构与树形结构总览)
+  - [3.1 五套核心结构](#31-五套核心结构)
+  - [3.2 四种“树”的形状](#32-四种树的形状)
+  - [3.3 模块身份、缓存 key 与去重](#33-模块身份缓存-key-与去重)
 - [4. dune：host 自己维护显式 module 树](#4-dunehost-自己维护显式-module-树)
+  - [4.1 定位](#41-定位)
+  - [4.2 核心数据结构](#42-核心数据结构)
+  - [4.3 静态加载：两套入口，一棵树](#43-静态加载两套入口一棵树)
+    - [4.3.1 builtin：19 个 JS ESM 模块构成真实依赖图](#431-builtin19-个-js-esm-模块构成真实依赖图)
+    - [4.3.2 resolver 与 loader](#432-resolver-与-loader)
+  - [4.4 动态 import：`ModuleGraph` + `same_origin`](#44-动态-importmodulegraph--same_origin)
+  - [4.5 `fast_forward()`：自底向上的状态收敛](#45-fast_forward自底向上的状态收敛)
+  - [4.6 V8 API 调用清单](#46-v8-api-调用清单)
+  - [4.7 依赖库角色：crabuv 的 `spawn` 与 rayon 线程池](#47-依赖库角色crabuv-的-spawn-与-rayon-线程池)
+  - [4.8 运行验证与边界](#48-运行验证与边界)
 - [5. LLRT：QuickJS 拥有图，host 提供 resolver/loader 链](#5-llrtquickjs-拥有图host-提供-resolverloader-链)
+  - [5.1 定位与装配](#51-定位与装配)
+  - [5.2 核心数据结构](#52-核心数据结构)
+  - [5.3 resolver / loader 链](#53-resolver--loader-链)
+  - [5.4 native module 与 JS bytecode](#54-native-module-与-js-bytecode)
+  - [5.5 CJS 兼容：`__cjs:` / `__cjsm:` 与 `RequireState`](#55-cjs-兼容__cjs--__cjsm-与-requirestate)
+  - [5.6 QuickJS API 调用清单](#56-quickjs-api-调用清单)
+  - [5.7 异步模型](#57-异步模型)
+  - [5.8 运行验证](#58-运行验证)
 - [6. txiki.js：一个 normalizer/loader，图完全在 QuickJS](#6-txikijs一个-normalizerloader图完全在-quickjs)
+  - [6.1 定位](#61-定位)
+  - [6.2 normalizer：名字规范化 + import map + internal 闸门](#62-normalizer名字规范化--import-map--internal-闸门)
+  - [6.3 loader：按协议/模块类型分派](#63-loader按协议模块类型分派)
+  - [6.4 QuickJS 的依赖图、链接与求值](#64-quickjs-的依赖图链接与求值)
+  - [6.5 builtin 交付：esbuild → tjsc → C 数组](#65-builtin-交付esbuild--tjsc--c-数组)
+  - [6.6 libuv 的角色：同步 loader，异步 job queue](#66-libuv-的角色同步-loader异步-job-queue)
+  - [6.7 运行验证](#67-运行验证)
 - [7. Deno：deno_graph + deno_core ModuleMap 双层图](#7-denodeno_graph--deno_core-modulemap-双层图)
+  - [7.1 两层分工](#71-两层分工)
+  - [7.2 `deno_core::ModuleMap` 的数据结构](#72-deno_coremodulemap-的数据结构)
+  - [7.3 `RecursiveModuleLoad`：并行装载 + 两级去重](#73-recursivemoduleload并行装载--两级去重)
+  - [7.4 V8 API：link 与 evaluate](#74-v8-apilink-与-evaluate)
+  - [7.5 动态 import 与 TLA](#75-动态-import-与-tla)
+  - [7.6 CLI 的 `deno_graph`](#76-cli-的-deno_graph)
+  - [7.7 Extension builtin](#77-extension-builtin)
+  - [7.8 tokio 的角色](#78-tokio-的角色)
+  - [7.9 运行验证](#79-运行验证)
+  - [7.10 Node compat：CJS loader 与双向 ESM 桥接](#710-node-compatcjs-loader-与双向-esm-桥接)
 - [8. Node.js：JS 层 ESM loader + 独立 CJS loader](#8-nodejsjs-层-esm-loader--独立-cjs-loader)
+  - [8.1 两套 loader](#81-两套-loader)
+  - [8.2 ESM 数据结构](#82-esm-数据结构)
+  - [8.3 ESM 加载流程：区分静态请求与 dynamic callback](#83-esm-加载流程区分静态请求与-dynamic-callback)
+  - [8.4 CJS 数据结构与 require 流程](#84-cjs-数据结构与-require-流程)
+  - [8.5 C++ `ModuleWrap` 与 V8 API](#85-c-modulewrap-与-v8-api)
+  - [8.6 CJS/ESM bridge](#86-cjsesm-bridge)
+  - [8.7 builtin：`BuiltinModule` map + ESM facade](#87-builtinbuiltinmodule-map--esm-facade)
+  - [8.8 libuv 的角色：同步 fs，不经过事件循环](#88-libuv-的角色同步-fs不经过事件循环)
+  - [8.9 运行验证](#89-运行验证)
 - [9. 横向对比](#9-横向对比)
-- [10. 行为验证：编译并运行五个 runtime](#10-行为验证编译并运行五个-runtime)
+  - [9.1 三种 API 共享什么，又在哪里分叉](#91-三种-api-共享什么又在哪里分叉)
+  - [9.2 static import：加载与链接路径](#92-static-import加载与链接路径)
+  - [9.3 dynamic import：Promise 由谁完成](#93-dynamic-importpromise-由谁完成)
+  - [9.4 require：独立 CJS loader 与 ESM 桥接](#94-require独立-cjs-loader-与-esm-桥接)
+  - [9.5 双向互操作、解析条件与 live binding](#95-双向互操作解析条件与-live-binding)
+  - [9.6 模块身份和缓存层次](#96-模块身份和缓存层次)
+  - [9.7 builtin 交付与编译缓存](#97-builtin-交付与编译缓存)
+  - [9.8 依赖库在 module 路径中的实际角色](#98-依赖库在-module-路径中的实际角色)
+  - [9.9 环、错误与进程存活](#99-环错误与进程存活)
+- [10. 行为验证：环境、脚本与结果](#10-行为验证环境脚本与结果)
+  - [10.1 本轮验证范围](#101-本轮验证范围)
+  - [10.2 可直接复现的脚本](#102-可直接复现的脚本)
+  - [10.3 实测结果](#103-实测结果)
+  - [10.4 实测与源码如何对应](#104-实测与源码如何对应)
 - [11. 对 rsvim 的映射](#11-对-rsvim-的映射)
+  - [11.1 原稿结构与可复用模式](#111-原稿结构与可复用模式)
+  - [11.2 dynamic import 的最小扩展](#112-dynamic-import-的最小扩展)
+  - [11.3 需要 CJS 时的新增责任](#113-需要-cjs-时的新增责任)
 - [12. 证据索引](#12-证据索引)
+  - [本轮修正与三种 API 的关键证据](#本轮修正与三种-api-的关键证据)
+  - [dune](#dune)
+  - [LLRT](#llrt)
+  - [txiki.js](#txikijs)
+  - [Deno](#deno)
+  - [Node.js](#nodejs)
+  - [QuickJS / rquickjs 通用](#quickjs--rquickjs-通用)
 - [13. 结论](#13-结论)
 
 ### 阅读路线
 
 | 想了解 | 建议阅读 |
 |---|---|
+| 先理解 require / import 的基本工作方式 | 从“入门”开始：导出值、导出绑定、执行时机、缓存与循环依赖 |
+| static import / dynamic import / require 的区别 | §1.2、§9.1–§9.6；Deno require 见 §7.10，LLRT require 见 §5.5 |
 | 五个 runtime 的核心数据结构 | §3.1，然后 §4.2 / §5.2 / §6.2 / §7.2 / §8.2 |
 | module 之间的树/图怎么长出来 | §3.2，然后 §4.3 / §5.3 / §6.4 / §7.3 / §8.3 / §8.4 |
 | V8 / QuickJS 用了哪些内置 API | §2（总合约），然后 §4.6 / §5.6 / §6.4 / §7.4 / §8.5 |
 | 依赖库（crabuv/tokio/libuv）做了什么 | §4.7 / §5.7 / §6.6 / §7.8 / §8.8，汇总在 §9.8 |
-| 示意图/流程图 | 全文 16 个 Mermaid 图 + 每个 runtime 的 ASCII 结构图 |
+| 示意图/流程图 | §2–§8 的 Mermaid 图与各 runtime 的 ASCII 结构图 |
 | 实际跑起来是什么行为 | §10 |
+
+---
+
+## 入门：CommonJS 与 ES modules 怎样工作
+
+模块首先解决一个很实际的问题：**把代码分到不同文件里，明确哪些东西给别人用，以及自己需要哪些文件提供的东西。** 每个模块有自己的变量作用域，不必把所有名字都塞进全局对象。
+
+JavaScript 生态里最常见的两套方案是 CommonJS（CJS）和 ES modules（ESM）。CommonJS 是较早形成的模块约定，本文主要讨论 Node 的 `require` / `module.exports` 用法；它不是 JavaScript 语言内建的模块语法。ES modules 则是 JavaScript 语言正式提供的模块机制，使用 `import` / `export`，V8、QuickJS 等引擎都理解这套机制。
+
+下面先讲常规工作方式，省略 loader hooks、特殊模块类型等细节。CJS 例子按 Node 的行为解释；五个 runtime 的兼容程度和例外放在后面的实现章节与 §9。
+
+### CommonJS：执行一个文件，拿回它交出来的值
+
+可以把一个 CJS 文件想成 runtime 包起来的一次函数调用：文件中的普通变量留在内部，通过 `module.exports` 交出对外接口。接口可以是一个对象，也可以直接是一个函数或其他值。
+
+```js
+// counter.cjs
+exports.count = 0;
+exports.increment = function () {
+  exports.count += 1;
+};
+```
+
+```js
+// main.cjs
+const counter = require("./counter.cjs");
+const { count } = counter;
+
+counter.increment();
+console.log(counter.count); // 1
+console.log(count);         // 0
+```
+
+这里 `require()` 拿到的是导出对象。`counter.count` 每次都去对象上读属性，所以能看到更新；`const { count } = counter` 则是普通的 JavaScript 解构赋值，把当时的数字 0 存进了本地变量。
+
+因此，不能简单说“CommonJS 的导出全是拷贝”：**对象可以共享，但从对象取出一个数字赋给本地变量，不会让这个变量自动跟着对象属性变化。**
+
+`exports` 起初是 `module.exports` 的简写引用，所以 `exports.count = 0` 可以添加导出。若想把整个接口换成一个函数或新对象，要给 `module.exports` 赋值；仅写 `exports = 新对象` 只是改了本地引用。
+
+`require()` 是一个真正的函数调用：可以放在函数或条件分支里，参数也可以在运行时计算。第一次加载某个 CJS 模块，通常经历：
+
+```text
+执行到 require("./counter.cjs")
+  → 找到目标文件
+  → 创建模块对象，并先放进缓存
+  → 执行文件中的代码，过程中填充 module.exports
+  → 返回 module.exports
+  → 调用者继续执行下一行
+```
+
+这是一个同步接口：普通 CJS 文件的顶层代码执行完，require 才返回。模块内部也可以启动定时器或网络请求，但 require 不会自动等待这些工作完成；模块需要自己导出 Promise、初始化函数或回调接口。
+
+### ES modules：先接好导出的名字，再执行模块代码
+
+ESM 将“对外提供什么”和“依赖谁”直接写进语言语法。下面的 `export` 声明两个具名导出，`import` 把它们接到调用方。
+
+```js
+// counter.mjs
+export let count = 0;
+
+export function increment() {
+  count += 1;
+}
+```
+
+```js
+// main.mjs
+import { count, increment } from "./counter.mjs";
+
+console.log(count); // 0
+increment();
+console.log(count); // 1
+```
+
+这里的 `import { count }` **不是对象解构**。它建立了一个指向导出变量的连接：每次读取 count，都能看到导出模块中这个变量的当前值。这就是后文所说的 **live binding（持续连接的绑定）**。
+
+调用方不能通过给这个导入名字赋值来修改导出变量；修改要由导出模块自己完成。如果导出的是对象，调用方仍可能修改对象的属性——“不能给导入名字重新赋值”不等于“对象被深度冻结”。
+
+ESM 常见的三个写法可以这样理解：
+
+| 写法 | 直观含义 |
+|---|---|
+| `export const x = 1` / `import { x } from "m"` | 模块提供名为 x 的接口，调用方按这个名字接入 |
+| `export default ...` / `import value from "m"` | 模块提供一个名为 default 的接口，调用方可以给它起自己的名字 |
+| `import * as ns from "m"` | 拿到按导出名访问的 namespace，例如 `ns.x`、`ns.default` |
+
+namespace 可以理解为“查看这个模块所有导出的窗口”；它不是 Node 的 `module.exports` 对象。默认导入也只是取 default 这一项，不会自动收集全部具名导出。
+
+对于普通的静态 import，核心流程是：
+
+```text
+读取入口文件
+  → 从 import / export-from 语句中找出依赖
+  → 继续获取依赖模块，形成依赖关系
+  → 把导入名与导出名对应起来（link，链接）
+  → 按依赖关系执行模块代码（evaluate，求值）
+```
+
+所以 static import 不是“执行到这一行才加载”的普通语句。下面例子中，即使 import 写在 console.log 后面，依赖模块仍先于入口模块的普通代码执行：
+
+```js
+// dep.mjs
+console.log("dep");
+
+// order.mjs，另一个文件
+console.log("main");
+import "./dep.mjs";
+
+// 运行 order.mjs，输出顺序：dep，然后 main。
+```
+
+将“接好名字”和“执行代码”分开，既让 runtime 能提前发现依赖，也让工具更容易分析哪些导出被使用。这里说的“静态”是指依赖声明能提前看见，并不意味着模块一定在构建期执行，也不意味着读取源码必须使用同步 I/O。
+
+### Dynamic import：需要的时候再开始，完成后给你模块接口
+
+`import()` 是 ESM 的运行期入口。它可以写在条件分支或函数里，说明符可以动态决定，返回一个 Promise。
+
+```js
+async function runFeature() {
+  const feature = await import("./feature.mjs");
+  feature.run();
+}
+```
+
+调用 runFeature 时才发起导入。正常情况下，await 会等到目标模块及其必要依赖加载、链接、求值完成，再得到 namespace；期间失败则抛到这个 await，调用者可以用 try/catch 处理。
+
+它与 static import 通常进入同一套 ESM 模块系统，并共享已经加载的模块。它也可以出现在 Node 的 CJS 文件中，作为加载 ESM 的入口。
+
+注意 `const { count } = await import("./counter.mjs")` 又回到了**普通对象解构**：此处保存的是当时读到的值。若要持续观察导出变量，可保留 namespace 并读取 `ns.count`。
+
+ESM 还允许模块在顶层使用 await，这叫 **top-level await（TLA）**。例如一个配置模块可以先等待配置加载，再完成初始化；静态依赖它的模块需要等它完成，`await import()` 也需要等它完成。这个等待规则不会因为底层文件读取是同步的而消失。
+
+### 缓存和循环依赖：为什么不能每次都重新执行文件
+
+正常情况下，同一个模块实例只初始化一次。多个调用方加载它，会复用它的导出和内部状态；static import 和 dynamic import 也通常共享 ESM 实例。因此，模块既能组织函数，也常用来保存共享状态。
+
+这里的“同一个”取决于 runtime 最终解析出的模块身份，不只是代码中写的文件名。两个不同拼写是否归到同一个实例，要看路径、URL、包解析和缓存规则；§3 和 §9 会进一步解释。
+
+缓存还让下面这种互相引用成为可能：
+
+```text
+A 依赖 B
+B 又依赖 A
+```
+
+**CommonJS** 通常先把 A 的模块对象放进缓存，再开始执行 A。A 加载 B，B 再 require A 时，就能拿到正在初始化的 A，而不会无限重跑。代价是 B 看到的可能只是 A 的部分 exports：A 还没有执行到的赋值，自然暂时不可见。
+
+**ESM** 会先建立两个模块之间的导入/导出连接，再处理循环中的执行顺序。连接已经存在，不代表变量已经赋值：如果 B 太早读取 A 中尚未初始化的 const/let，就会报错；这就是后文的 TDZ。若只是先建立函数引用，等模块初始化后再调用，环完全可能正常工作。
+
+所以判断循环是否正确，既要看 runtime 有没有重复创建模块，也要看程序是否过早读取了尚未准备好的值。不能简单把“有环”理解成“必然报错”。
+
+### 哪些是模块规则，哪些是 runtime 自己决定的
+
+ESM 规定导入导出如何连接、如何执行和等待；但 `import "some-package"` 到底去哪找文件，不完全由语言决定。`node_modules`、package.json、HTTP URL、import map、权限检查，都是 runtime 需要提供的策略。这也解释了为什么五个 runtime 都支持 import，却不一定能直接运行同一个 npm 包。
+
+本文示例用 `.cjs` 和 `.mjs` 清楚地区分两种格式；在 Node 中，`.js` 还受 package.json 的 `type` 等规则影响。它们是 runtime 的文件识别规则，不是“JavaScript 看见某个扩展名就天然具备所有模块行为”。
+
+现代 Node、Deno 还允许 require 一部分 ESM 模块，但要求依赖图能同步求值，含 TLA 时会拒绝。LLRT 的实现方式不同，dune 和 txiki 则没有内建 Node CJS loader。后面的架构分析会沿着三个问题展开：**如何找到模块、如何复用模块、什么时候把结果交给调用方。**
 
 ---
 
@@ -47,10 +292,10 @@
 | Runtime | Repo | HEAD | Date | Engine | Host language |
 |---|---|---|---|---|---|
 | **dune** | `aalykiot/dune` | `5958b64` (v0.11.4) | 2026-10-15 | V8 (`rusty_v8` 150.2.0) | Rust |
-| **LLRT** | `awslabs/llrt` | `d2ae1d9` (v0.9.0-beta) | 2026-10-20 | QuickJS-NG 0.16.2 via `rquickjs` 0.14.0 | Rust |
+| **LLRT** | `awslabs/llrt` | `bd60ee6` (v0.9.0-beta) | 2026-10-21 | QuickJS-NG 0.16.2 via `rquickjs` 0.14.0 | Rust |
 | **txiki.js** | `saghul/txiki.js` | `fc2b5f3b` | 2026-10-21 | QuickJS-NG (`10b9969`) | C |
-| **Deno** | `denoland/deno` | `d7205acbed` | 2026-10-22 | V8 via `deno_core` | Rust |
-| **Node.js** | `nodejs/node` | `a232998e0` | 2026-10-22 | V8 | C++ / JavaScript |
+| **Deno** | `denoland/deno` | `7e4306fbe8` | 2026-10-22 | V8 via `deno_core` | Rust |
+| **Node.js** | `nodejs/node` | `fd204481115` | 2026-10-22 | V8 | C++ / JavaScript |
 
 依赖库源码：
 
@@ -62,21 +307,23 @@
 | `rquickjs` | 0.14.0 | LLRT 对 QuickJS module loader 的 Rust 封装 |
 | `deno_graph` | 0.111.1 | Deno CLI 的静态依赖图 |
 
-> 行号会随上游提交漂移，证据索引优先按函数名/结构名搜索。本文对 2026 快照中的命名变化做了复核，例如 Deno 的 `ModuleMap` 已不再是 `modules/by_id/by_specifier` 三件套，Node 主线程 ESM 入口已统一走 `ModuleJobSync`。
+> 表中为本轮 review 的本地 HEAD。原稿记录的 Node `a232998e0`、Deno `d7205acbed`、LLRT `d2ae1d9` 已与本地 HEAD 不同。行号优先配合函数名搜索；Node 当前主线程普通 ESM 加载主要使用 `ModuleJobSync`，仍有特殊路径使用 `ModuleJob`。
+
+本轮核查了五个 runtime 的 host 源码、txiki 的 `deps/quickjs`（实际 checkout 为 `10b9969`），以及 LLRT 的 Cargo 依赖 `rquickjs-sys-0.14.0/quickjs`。两份 QuickJS 源码均确认了 compile-only 期间递归解析依赖、先标记 resolved 再递归、dynamic import 等待 evaluation 等关键路径；行号分别以 §12 指定的源码为准。
 
 ### 0.2 运行验证环境
 
-除源码阅读外，本文实际编译/运行了这些 runtime 来做行为对照：
+dune、LLRT、Deno 使用用户通过 `cargo build` 构建的本地 debug binary；txiki 使用用户通过 `make` 构建的 `build/tjs`。Node 未完成本地构建，使用已安装版本作行为对照：
 
 | Runtime | 运行方式 | 版本/备注 |
 |---|---|---|
 | dune | 本地 `target/debug/dune` | `dune 0.11.4` |
 | LLRT | 本地 `target/debug/llrt` | `LLRT v0.9.0-beta` |
-| txiki.js | 从源码 clone + submodule + CMake 构建 | `tjs v26.6.0`，QuickJS-NG 子模块 |
-| Deno | 已安装二进制 | `deno 2.9.7` |
-| Node.js | 已安装二进制 | `node v26.12.1` |
+| txiki.js | 本地 `build/tjs` | `v26.6.0` |
+| Deno | 本地 `target/debug/deno` | `deno 2.9.8 (stable, debug)` |
+| Node.js | 已安装二进制 | `node v24.14.0` |
 
-验证脚本与输出见 [§10](#10-行为验证编译并运行五个-runtime)。运行版本不一定与源码 HEAD 完全一致，因此**架构结论以源码为准，行为结论只用于交叉验证**。
+验证脚本与输出见 [§10](#10-行为验证环境脚本与结果)。**源码 HEAD 与测试二进制版本分别记录**：例如 Node HEAD 的 `ModuleJobSync` 路径由源码确认，安装的 Node 24 只用于行为对照。原稿的 Deno 2.9.7 / Node 26.12.1 输出不作为本轮验证证据。
 
 ### 0.3 相关文档
 
@@ -89,96 +336,62 @@
 
 ---
 
-## 1. 统一生命周期与三层责任
+## 1. 统一生命周期与四层责任
 
-### 1.1 一条流水线
+### 1.1 先区分加载图、语义图与 CJS 调用关系
 
-不管 runtime 用什么 engine，一个 module 基本都走同一条流水线：
-
-```text
-specifier
-  -> resolve        解析为 canonical URL / path / builtin id
-  -> load           获取源码：文件、HTTP、native module、bytecode、snapshot
-  -> compile        解析 JS / TS / JSON / WASM / CJS，生成 engine module
-  -> link/instantiate
-                    建立依赖图，绑定 import/export
-  -> evaluate       执行模块；可能遇到 top-level await
-  -> namespace/cache
-```
-
-但“谁拥有这条流水线”差异极大。可以分成三层：
+ESM 的概念流程是：
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│ 策略层（policy）                                             │
-│   resolve / load / format detection / permissions / hooks    │
-│   dune: Rust loader    Deno: CLI+deno_core                   │
-│   Node: JS loader      LLRT/txiki: QuickJS loader 回调       │
-├─────────────────────────────────────────────────────────────┤
-│ 图与状态层（graph & state）                                  │
-│   module registry / cache / status / pending futures         │
-│   dune: ModuleMap+EsModule    Deno: ModuleMap                │
-│   Node: ModuleLoader+ModuleJob                               │
-│   LLRT/txiki: QuickJS ctx->loaded_modules                    │
-├─────────────────────────────────────────────────────────────┤
-│ 引擎层（engine）                                             │
-│   V8: 只给回调，图归 embedder                                │
-│   QuickJS: 自己 resolve/link/evaluate/cache                  │
-└─────────────────────────────────────────────────────────────┘
+specifier → resolve → load/transform → compile → link/instantiate → evaluate
+                ↕ 模块身份与实例缓存                       ↓
+                    去重贯穿加载过程                bindings / namespace
 ```
 
-### 1.2 真正决定架构的五个问题
+这不是所有引擎严格分开的 API 步骤。QuickJS 的 `JS_Eval(MODULE | COMPILE_ONLY)` 会在编译期间递归解析、加载静态依赖；CJS 通常编译成函数 wrapper，没有 ESM 的预链接阶段。缓存也不是执行完成才写入：为处理环，通常需要在递归加载或执行之前登记实例。
 
-1. **谁拥有 module graph？**
-   - host/embedder（dune）
-   - engine/runtime core（QuickJS；Deno 的 `deno_core`）
-   - JavaScript 层（Node ESM）
+| 层次 | 责任 | 典型数据结构/入口 |
+|---|---|---|
+| 解析与加载策略 | 包解析、URL、import map、权限、格式识别、源码/字节码获取 | runtime resolver/loader、Node translators、Deno CLI graph |
+| 模块身份与缓存 | 将规范化名字映射到实例；登记加载中模块；保存装载任务 | dune `ModuleMap`、Node `loadCache`、Deno `ModuleMapData`、QuickJS `loaded_modules`；CJS 另有缓存 |
+| 引擎链接与求值 | import/export 绑定、TDZ、循环依赖的 SCC、TLA 依赖传播 | V8 `SourceTextModule`；QuickJS `JSModuleDef` |
+| API 与 Promise 桥接 | static import、`import()`、`require()` 的入口和返回值；错误传播、jobs/event loop | Node `ModuleJob`、Deno `pending_*`、dune dynamic resolver、QuickJS import jobs、LLRT require 泵 |
 
-2. **resolution 和 load 的策略放在哪？**
-   - 只支持 import map / URL / file
-   - 支持 Node 的 `node_modules` 和 `package.json#exports`
-   - 支持 npm / JSR / `node:` / permissions
+**加载依赖图**回答“哪些源码还没拿到”；**引擎语义图**回答“哪些绑定已建立、哪些模块还在等待异步依赖”。CJS 的 `require(expr)` 在执行时才产生依赖，不必也通常不能预先完整表达成静态 ESM 请求图。Node/Deno 的 `module.children` 和 LLRT 的 `RequireState` 服务于 CJS，不能与静态 import 边等同。
 
-3. **builtin 以什么形式存在？**
-   - JS ESM 源文件（dune）
-   - native module（LLRT 的 `ModuleDef`、txiki 的 C module）
-   - 预编译 bytecode（LLRT、txiki）
-   - snapshot / lazy extension（Deno、Node）
+### 1.2 三种 API 的合约
 
-4. **link/evaluate 的语义由谁负责？**
-   - V8 host 自己 `instantiate_module` / `evaluate`（dune）
-   - QuickJS engine 自己递归（LLRT、txiki）
-   - `deno_core` 的 `ModuleMap`（Deno）
-   - Node 的 JS `ModuleJob` + V8 `ModuleWrap`
+| API | 依赖何时发现 | 返回/绑定形式 | 完成与错误语义 |
+|---|---|---|---|
+| `import { x } from "m"` | 解析模块时发现静态请求 | ESM import binding；默认导入也只是一个 binding | 链接先于模块体执行；依赖的异步求值会延迟依赖者；错误由入口求值传播 |
+| `import(expr)` | 执行表达式时计算说明符 | Promise；普通 evaluation-phase import 通常以 namespace 完成 | 加载、链接、求值包括 TLA 完成后才成功；失败应 reject |
+| `require(expr)` | 执行函数调用时 | CJS 通常返回 `module.exports`；ESM 互操作由 runtime 决定 | 同步返回或抛错；Node/Deno 拒绝含 TLA 的 ESM 图，LLRT 使用同步等待机制 |
 
-5. **dynamic import / TLA 的 Promise 由谁创建和结算？**
-   - host 创建 resolver（dune、Deno）
-   - engine 创建 Promise（QuickJS）
-   - JS loader 创建 job、C++ 再包一层 Promise（Node）
+本文对比普通 evaluation-phase import；source/defer phase 在 API 清单中注明，不把其返回形式混入上述默认流程。namespace 导出可调用 `then` 时还涉及 Promise thenable assimilation，因此不能把所有 `import()` 的用户可见结果无条件视为 namespace。
 
-### 1.3 三条架构主线
+static import 与 dynamic import 通常共享 ESM 注册表、解析规则和实例；两者入口、调度与错误交付不同。`require()` 使用 require 条件解析包，可能与 import 条件命中不同文件。只有身份与缓存桥接均一致时，才能讨论“同一份实例”。
 
-```text
-host/embedder-owned              engine/core-owned                 JS-owned
+### 1.3 五种 runtime 的分工
 
-dune                             QuickJS: LLRT / txiki             Node ESM
-                                 deno_core: Deno
-```
+| Runtime | host 的加载/缓存职责 | 引擎职责 | CJS |
+|---|---|---|---|
+| dune | Rust `ModuleMap`、`EsModule` 加载树和 `fast_forward`；自行桥接 dynamic Promise | V8 链接、SCC、求值和 TLA | 无内建 Node CJS loader |
+| LLRT | resolver/loader 链、`ModuleCache.esm`、`RequireState` | QuickJS 注册表、静态依赖图、链接求值、dynamic import jobs | 在 ESM 引擎之上模拟 exports 与同步 require |
+| txiki.js | C normalizer/loader、builtin 表、import map、event loop | QuickJS 注册表、静态依赖图、链接求值、dynamic import jobs | 无内建 Node CJS loader |
+| Deno | CLI `deno_graph`、core `ModuleMap` 和装载 futures；另有 CJS loader | V8 链接、SCC、求值和 TLA | Node 风格函数 wrapper 与独立缓存 |
+| Node.js | JS `ModuleLoader`/`ModuleJob`/`loadCache`；C++ `ModuleWrap` 桥接 V8 | V8 链接、SCC、求值和 TLA | 独立同步 loader 与缓存 |
 
-- **dune** 把 module 状态机完整写在 Rust host 里，V8 只负责编译和提供回调；
-- **LLRT / txiki** 只实现 normalizer/loader，图、链接、求值、缓存都由 QuickJS 负责；
-- **Deno** 把运行时图放进 `deno_core::ModuleMap`，把解析/构建策略放进 CLI 的 `deno_graph`；
-- **Node** 把 ESM 状态机放进 JavaScript，C++ 只做 V8 的薄适配；CJS 是另一套同步 loader。
+V8 和 QuickJS 都实现 ESM 语义图。主要差别是：QuickJS 还内建按 module name/attributes 查找的注册表及递归 loader 驱动；V8 host 需要自行组织模块身份和加载。选择 V8 不意味着要重新实现 ESM 的环处理或 TLA 算法。
 
 ---
 
 ## 2. 引擎 API 合约：V8 与 QuickJS
 
-理解 module 数据结构之前，先要理解引擎暴露的 API 边界。V8 和 QuickJS 在这件事上的哲学几乎相反。
+理解 module 数据结构之前，先区分引擎已经实现的语义和需要 host 提供的加载策略。
 
-### 2.1 V8：embedder 必须自己实现 module 生命周期
+### 2.1 V8：host 组织加载，引擎执行链接与求值
 
-V8 原生支持 ES module 的**编译、实例化、求值原语**，但不提供 module registry、resolver、loader。embedder 必须提供以下回调/调用：
+V8 实现 ES module 的编译、绑定、循环依赖和 TLA 求值，但不提供按 URL/specifier 查找的模块注册表、包解析或 I/O loader。embedder 提供模块身份、加载策略和以下回调/调用：
 
 | API | 调用者 | 作用 |
 |---|---|---|
@@ -189,7 +402,7 @@ V8 原生支持 ES module 的**编译、实例化、求值原语**，但不提�
 | `v8::Module::InstantiateModule(context, resolve_cb)` | embedder | 实例化；每条 import 边回调 `resolve_cb` 要求返回 `v8::Module` |
 | `v8::Module::Evaluate(context)` | embedder | 求值，返回 `v8::Promise`（TLA 时 pending） |
 | `v8::Module::GetStatus()` | embedder | `Uninstantiated / Instantiating / Instantiated / Evaluating / Evaluated / Errored` |
-| `v8::Module::GetException()` | embedder | 取求值/链接异常 |
+| `v8::Module::GetException()` | embedder | 状态为 `Errored` 时取异常；实例化失败还需检查调用返回值/捕获的异常 |
 | `v8::Module::GetModuleNamespace()` | embedder | 取 namespace object，用于 `import()` 的 resolve 值 |
 | `v8::Module::GetIdentityHash()` | embedder | 取 module 身份哈希，常被当作 map 的辅助 key |
 | `v8::Module::CreateSyntheticModule(...)` | embedder | 创建 synthetic module（Node CJS/JSON/builtin、Deno synthetic ESM） |
@@ -200,21 +413,25 @@ V8 原生支持 ES module 的**编译、实例化、求值原语**，但不提�
 | `Isolate::SetHostInitializeImportMetaObjectCallback(cb)` | embedder | 第一次访问 `import.meta` 时填充对象 |
 | `Module::InstantiateModule` 的 `ResolveModuleCallback` | V8 → embedder | 参数含 `specifier`、`import_attributes`、`referrer`，返回被依赖的 `v8::Module` |
 
-一个 V8 module 的状态机如下：
+V8 内部状态机的简化图如下（名称采用公开 API 命名，额外展开内部 async 状态）：
 
 ```mermaid
 stateDiagram-v2
   [*] --> Uninstantiated: CompileModule
   Uninstantiated --> Instantiating: InstantiateModule
   Instantiating --> Instantiated: 所有依赖 resolve 成功
-  Instantiating --> Errored: resolve/链接失败
+  Instantiating --> Uninstantiated: 实例化失败后回滚未完成部分
   Instantiated --> Evaluating: Evaluate
   Evaluating --> Evaluated: 同步完成
-  Evaluating --> Evaluating: TLA pending
+  Evaluating --> EvaluatingAsync: TLA 或异步依赖
+  EvaluatingAsync --> Evaluated: 异步求值完成
+  EvaluatingAsync --> Errored: 异步求值失败
   Evaluating --> Errored: 抛异常 / reject
   Evaluated --> [*]
   Errored --> [*]
 ```
+
+`GetStatus()` 把内部 `kEvaluatingAsync` 和 `kEvaluated` 都映射为公开的 `kEvaluated`，所以 **`Evaluated` 不等于 evaluation Promise 已 fulfilled**。`Module::Instantiate` 失败会调用 `ResetGraph`；链接失败也不能一概画成 `Errored`。证据：Node vendored V8 的 `src/api/api.cc::Module::GetStatus`、`src/objects/module.cc::Instantiate` 和 `src/objects/source-text-module.cc::MaybeTransitionComponent`。
 
 静态 import 的完整调用链（以 dune 为例，Deno/Node 形状相同）：
 
@@ -240,7 +457,7 @@ sequenceDiagram
   V8-->>H: namespace object
 ```
 
-dynamic import 的契约略有不同：V8 调用 host callback，host 必须**立即返回一个 Promise**；Promise 的 resolve 值必须是 namespace object（不是 evaluation 结果）。
+普通 dynamic import 触发另一个 host callback，该回调返回 Promise。host 必须把 evaluation Promise 的成功/失败桥接到它：成功时以 namespace 完成，失败时 reject。取得 namespace 本身不证明求值已完成。
 
 ```mermaid
 sequenceDiagram
@@ -252,20 +469,21 @@ sequenceDiagram
   H->>H: new PromiseResolver
   H-->>V8: promise
   H->>H: resolve/load/link/evaluate（可异步）
+  H->>H: 等待 evaluation Promise fulfilled
   H->>H: resolver.resolve(module.GetModuleNamespace())
   V8-->>JS: await 得到 namespace
 ```
 
 关键点：
 
-- V8 **不**缓存 module；同一 specifier 是否复用同一个 `v8::Module` 完全由 embedder 决定。
-- V8 **不**替 host 做 cycle 处理；循环依赖由 host 的 `resolve_cb` 返回已存在的 module 来闭合。
-- V8 的 `Evaluate` 返回 Promise；host 如果丢弃它，就等价于“不等待 TLA”。dune 正是这样。
+- V8 没有按 specifier 查找的 host 注册表；同一身份是否返回同一个 `v8::Module` 由 host 决定。对同一个 module，V8 会保留状态和求值结果。
+- host 要避免加载递归重复创建实例，并在 `resolve_cb` 返回已有 module；V8 自己执行链接/求值的 DFS、SCC 和 TLA 传播。
+- `Evaluate` 返回 Promise；host 丢弃它不会取消 V8 的异步求值，但会失去等待完成、向 `import()` 传播错误和判断 liveness 的依据。dune 的问题在这一桥接层。
 - `import.meta` 也是 host 回调；V8 只负责在第一次访问时调用它。
 
 ### 2.2 QuickJS：engine 自己拥有 module 图
 
-QuickJS 的 host 接口小得多：注册 normalizer、loader、attribute checker，剩下交给 engine。
+QuickJS 内建模块注册表和递归装载驱动；host 注册 normalizer、loader、attribute checker，提供文件/包/builtin 策略，并负责推进 jobs 与外部 I/O。CJS 兼容仍需 host 额外实现。
 
 | API | 调用者 | 作用 |
 |---|---|---|
@@ -273,7 +491,7 @@ QuickJS 的 host 接口小得多：注册 normalizer、loader、attribute checke
 | `JS_SetModuleNormalizeFunc2(rt, normalize)` | host（可选） | 单独注册带 attributes 的 normalizer |
 | `normalize(ctx, base_name, name, opaque)` | QuickJS → host | 把 `(base, specifier)` 转成 canonical module name |
 | `load(ctx, name, opaque, attributes)` | QuickJS → host | 返回 `JSModuleDef *` |
-| `JS_Eval(ctx, src, len, filename, JS_EVAL_TYPE_MODULE \| JS_EVAL_FLAG_COMPILE_ONLY)` | host | 源码编译为 module，不执行 |
+| `JS_Eval(ctx, src, len, filename, JS_EVAL_TYPE_MODULE \| JS_EVAL_FLAG_COMPILE_ONLY)` | host | 编译并递归解析/加载静态依赖，不执行模块体 |
 | `JS_ReadObject(ctx, buf, len, JS_READ_OBJ_BYTECODE)` | host | 字节码反序列化为 module |
 | `JS_ResolveModule(ctx, obj)` | host（可选） | 递归解析依赖；`JS_Eval`/`JS_ReadObject` 之后可用 |
 | `JS_EvalFunction(ctx, module_val)` | host | 内部完成 link + evaluate，返回 evaluation Promise |
@@ -283,10 +501,12 @@ QuickJS 的 host 接口小得多：注册 normalizer、loader、attribute checke
 | `JS_SetModulePrivateValue` / `JS_GetModulePrivateValue` | host | 给 C module 绑定私有数据 |
 | `JS_NewPromiseCapability` | host/engine | 创建 dynamic import / TLA 的 Promise |
 | `JS_ExecutePendingJob(rt, &ctx)` | host | 驱动 QuickJS job queue（dynamic import job 也在这里） |
-| `JS_LoadModule(ctx, base, filename)` | host | 加载并求值一个模块，返回 Promise |
+| `JS_LoadModule(ctx, base, filename)` | host | 直接启动加载/求值并返回 Promise；区别于 JS `import()` 先排 job |
 | `JS_GetScriptOrModuleName(ctx, level)` | host | 取当前模块名（LLRT CJS 用它索引 exports） |
 
-`JSModuleDef` 是 QuickJS 的 module 节点，也是“树/图”真正所在：
+`COMPILE_ONLY` 不代表不加载依赖：`JS_EvalInternal` 在检查此 flag 之前就调用 `js_resolve_module`。这与 V8 `CompileModule` 只生成静态请求的边界不同；LLRT 的 `Module::declare` 和 txiki 的源码 loader 都会进入这条路径。
+
+`JSModuleDef` 是 QuickJS 的 ESM 语义图节点：
 
 ```c
 struct JSModuleDef {
@@ -335,7 +555,7 @@ typedef struct JSReqModuleEntry {
 } JSReqModuleEntry;
 ```
 
-模块缓存不是 host 的 hash map，而是每个 `JSContext` 的 `ctx->loaded_modules` 双向链表；查找 `js_find_loaded_module()` 线性扫描，key = `module_name` atom + import attributes。
+QuickJS 的内建实例注册表是每个 `JSContext` 的 `ctx->loaded_modules` 双向链表；`js_find_loaded_module()` 按 module name atom 和 attributes 线性查找。host 仍可增加缓存，例如 LLRT 的 `ModuleCache.esm` 和 `RequireState`。
 
 ```mermaid
 flowchart TD
@@ -375,20 +595,20 @@ stateDiagram-v2
 
 ### 2.3 两种合约的对照
 
-| 维度 | V8 | QuickJS |
+| 维度 | V8 | QuickJS-NG（本文依赖版本） |
 |---|---|---|
-| module 对象 | `v8::Module`，host 持有 `Global` | `JSModuleDef *`，engine 持有 |
-| module cache | 无，host 自建 | `ctx->loaded_modules` 链表 |
-| resolve | `module_resolve_cb` | normalizer |
-| load | host 自己读文件/HTTP/native | loader 回调 |
-| link/instantiate | host 调 `InstantiateModule` + resolve 回调 | `js_link_module`（`JS_EvalFunction` 内部） |
-| evaluate | host 调 `Evaluate`，拿 Promise | `js_evaluate_module`（`JS_EvalFunction` 内部） |
-| dynamic import Promise | host 创建并 resolve | engine 创建，host 只负责加载 |
-| TLA | host 决定是否等待 Promise | engine 原生跟踪 |
-| synthetic/native module | `CreateSyntheticModule` | `JS_NewCModule` |
-| host 代码量 | 大（dune / Deno / Node 都要自建状态机） | 小（LLRT / txiki 只写 loader） |
+| module 对象 | `v8::Module`；host 用 `Global` 持有 | `JSModuleDef *`；context 注册表持有 |
+| 按名字的实例注册表 | host 自建 | `ctx->loaded_modules`；host 可另加缓存 |
+| 编译边界 | `CompileModule` 生成静态请求，不自行读依赖 | `JS_Eval(MODULE \| COMPILE_ONLY)` 同时递归解析/加载依赖 |
+| resolve/load 策略 | host；静态 resolve callback 返回 module | host normalizer/loader；engine 驱动递归 |
+| 链接、环、live binding | V8 实现；host 调 `InstantiateModule` | QuickJS 实现；由 `JS_EvalFunction` 进入 |
+| 求值、TLA 依赖传播 | V8 实现；`Evaluate` 返回 Promise | QuickJS 实现；`JS_EvalFunction` 返回 Promise |
+| dynamic import | host callback 桥接加载、evaluation 和 namespace | engine 创建 Promise、排 job、等待 evaluation |
+| jobs 与外部 I/O | host 推进 microtasks/event loop | host 推进 `JS_ExecutePendingJob` 和外部 I/O |
+| synthetic/native module | `CreateSyntheticModule` + exports | `JS_NewCModule` + export 声明/赋值 |
+| 编译缓存 | `CreateCodeCache` 等；Node/Deno 有实际使用路径 | `JS_WriteObject` / `JS_ReadObject` bytecode |
 
-这解释了一个常见现象：**V8 runtime 的 module 代码量通常远大于 QuickJS runtime**，因为 V8 把图的所有权留给了 embedder。
+不要把三种缓存混为一谈：**resolve cache** 保存解析结果，**module instance cache** 保存模块身份、状态与导出，**code/bytecode cache** 缓存编译产物。V8 没有第一、二类的通用 host 策略，并不意味着它没有模块状态、求值复用或编译缓存。
 
 ---
 
@@ -399,14 +619,14 @@ stateDiagram-v2
 | Runtime | 全局注册表/缓存 | 树/图节点 | 依赖边 | 状态/并发 |
 |---|---|---|---|---|
 | **dune** | `ModuleMap`：`by_path: HashMap<path, Global<Module>>`、`by_id: HashMap<i32, Vec<(path, Global<Module>)>>`、`seen: HashMap<path, ModuleStatus>`、`pending: Vec<Rc<RefCell<ModuleGraph>>>` | `EsModule { path, status, dependencies: Vec<Rc<RefCell<EsModule>>>, exception, is_dynamic_import }` | `EsModule.dependencies`（`Rc` 树） | `ModuleStatus::{Fetching,Resolving,Duplicate,Ready}`；`EsModuleFuture` 在 event loop 中推进 |
-| **LLRT** | QuickJS `ctx->loaded_modules`；host 侧 `ModuleResolver.modules: HashSet`、`ModuleLoader.modules: HashMap<name, fn>`、`BYTECODE_CACHE: phf::Map`、`NODE_MODULES_PATHS_CACHE` | `JSModuleDef`（engine） | `JSReqModuleEntry[]`（engine） | QuickJS `JSModuleStatus`；`RequireState{cache,exports,progress}` 处理 CJS 环 |
+| **LLRT** | QuickJS `ctx->loaded_modules`；host 侧 `ModuleResolver.modules: HashSet`、`ModuleLoader.modules: HashMap<name, fn>`、`BYTECODE_CACHE: phf::Map`、`NODE_MODULES_PATHS_CACHE`、`ModuleCache.esm`、`RequireState` | `JSModuleDef`（engine） | `JSReqModuleEntry[]`（engine） | QuickJS `JSModuleStatus`；`RequireState{cache,exports,progress}` 处理 CJS 环 |
 | **txiki.js** | QuickJS `ctx->loaded_modules`；host 只有 `builtins[]` 和 `qrt->builtins.import_map_resolver` | `JSModuleDef`（engine） | `JSReqModuleEntry[]`（engine） | QuickJS 状态机；import map 是 JS 闭包 |
-| **Deno** | `ModuleMap`：`data: ModuleMapData { handles, handles_inverted, info, by_name, main_module_id, lazy_esm_sources, ... }` + `dynamic_import_map` + 三组 `TrackedFutures/TrackedVec` | `ModuleInfo { id, main, name, requests, module_type, is_internal }`；`v8::Global<Module>` 单独存 `handles[id]` | `ModuleInfo.requests: Vec<ModuleRequest>`；运行时再经 V8 resolve 回调映射回 handle | `ModuleId = usize`；`RecursiveModuleLoad{state,pending,visited,visited_as_alias}`；`pending_tla_waiters` |
+| **Deno** | `ModuleMap`：`data: ModuleMapData { handles, handles_inverted, info, by_name, main_module_id, lazy_esm_sources, ... }` + `dynamic_import_map` + 三组 `TrackedFutures/TrackedVec`；CJS `Module._cache` | `ModuleInfo { id, main, name, requests, module_type, is_internal }`；`v8::Global<Module>` 单独存 `handles[id]` | `ModuleInfo.requests: Vec<ModuleRequest>`；运行时再经 V8 resolve 回调映射回 handle | `ModuleId = usize`；`RecursiveModuleLoad{state,pending,visited,visited_as_alias}`；`pending_tla_waiters` |
 | **Node.js** | `ModuleLoader.loadCache: LoadCache`（`url → {type → ModuleJobBase}`）、`#resolveCache`；CJS `Module._cache: filename → Module`、`_pathCache`、`_extensions`；`BuiltinModule.map` | ESM `ModuleJobBase/ModuleJob/ModuleJobSync` + C++ `ModuleWrap`；CJS `Module { id, path, exports, filename, loaded, children, paths }` | `ModuleJob` 通过 `ModuleWrap.getModuleRequests()` 递归 `getOrCreateModuleJob`；CJS `module.children` 只是观察树 | V8 `ModuleStatus` + job 状态；CJS `loaded`、环依赖占位 exports |
 
 ### 3.2 四种“树”的形状
 
-ES module 图在语义上是 **DAG + 环**，不是严格的树。这里的“树”指 loader 的遍历视角：
+ES module 的静态依赖是**可能含环的有向图**。去重不会消除环；只有将强连通分量（SCC）缩成节点后，才得到 DAG。这里的“树”指 loader 的遍历视角：
 
 - dune 把它真的建成一棵 `EsModule` 树，用 `Duplicate` 叶子表示“这个 path 已经出现过”；
 - QuickJS 在 `JSModuleDef.req_module_entries` 里存图边，遍历时看起来像 DFS 树；
@@ -429,7 +649,7 @@ ModuleGraph.root_rc
 
 注意：`EsModule` 节点**不做去重**，相同 path 可能出现多个 `Rc` 节点；去重发生在 `seen` 表，依赖节点用 `ModuleStatus::Duplicate` 表示“路径已被别人加载”。
 
-**(b) QuickJS：engine 内的 DAG，host 只看到 `JSModuleDef*`**
+**(b) QuickJS：engine 内的有向图，host 通过 `JSModuleDef*` 交接**
 
 ```text
 ctx->loaded_modules (双向链表)
@@ -442,7 +662,7 @@ a.req_module_entries -> *shared
 b.req_module_entries -> *shared       // 同一个 JSModuleDef
 ```
 
-引擎在 `resolve` 阶段就按 `(name, attributes)` 去重，因此图是 DAG；环在 host resolve 返回已存在模块时闭合。
+引擎按 `(name, attributes)` 查找已有节点；模块先登记，解析依赖前先设置 `resolved` 标记，因此环可以闭合且不会无限递归。链接和求值阶段再由 engine 的 SCC 算法处理环。
 
 **(c) Deno：索引表 + 独立 handle 数组**
 
@@ -486,7 +706,7 @@ Node 的 ESM 图由 `ModuleJob` 对象和 V8 `ModuleWrap` 共同表达；CJS 图
 | Runtime | 模块身份 | 缓存 key | 并发 import 去重 |
 |---|---|---|---|
 | **dune** | 解析后的 path 字符串 | `ModuleMap.by_path[path]`；`seen[path]` | `ModuleGraph.same_origin` 合并同一 root 的 resolver；`Duplicate` 状态避免重复加载 |
-| **LLRT** | QuickJS 规范化后的 module name + attributes | `ctx->loaded_modules`（线性扫描 `module_name` atom + attributes） | QuickJS 在调用 loader 前查已加载表；`ModuleLoader.modules.remove(name)` 保证 native 只声明一次 |
+| **LLRT** | QuickJS name + attributes；host 另有 path 身份 | `ctx->loaded_modules` + `ModuleCache.esm[path]` + `RequireState` | QuickJS 查实例；host cache 桥接不同入口；native loader 的 `remove` 是一次性装载约束，并非通用去重算法 |
 | **txiki.js** | normalizer 返回的字符串 + attributes | `ctx->loaded_modules` | 同上；import map 在 normalizer 中同步解析 |
 | **Deno** | `ModuleId`；字符串侧是 `(ModuleName, RequestedModuleType)` | `handles[id]` + `by_name`；重定向用 `SymbolicModule::Alias` | `RecursiveModuleLoad.visited: HashSet<ModuleReference>` + `visited_as_alias` |
 | **Node ESM** | URL + import type | `loadCache[url][type]`；`#resolveCache[parentURL][specifier+attrs]` | `ModuleJob` 在 `syncLink` 中**先把自己写进 loadCache**，再递归 link |
@@ -494,10 +714,12 @@ Node 的 ESM 图由 `ModuleJob` 对象和 V8 `ModuleWrap` 共同表达；CJS 图
 
 一个容易被忽略的差异：
 
-- **dune 用 path 字符串**，不做 URL 归一化（HTTP 除外）；
+- **dune 用 resolve 返回的 path 字符串**。文件补扩展名发生在 load 层，不回写身份；`./a` 与 `./a.js` 可指向同一物理文件却形成两个实例（§10）；
 - **Deno 用 `ModuleSpecifier` + `RequestedModuleType`**，重定向是 alias；
 - **Node ESM 用 URL + type 两级 key**，`import './a.json' with {type:'json'}` 与普通 JS 不会互相覆盖；
-- **QuickJS 用 name + attributes**，同名不同 `type` 会得到两个 `JSModuleDef`。
+- **QuickJS 查找键包含 name + attributes**，不同 attributes 会导致注册表 miss；loader 仍可拒绝请求或返回 host cache 中的对象，因此不能保证任意不同 attributes 必然生成两个可用实例。
+
+Deno CJS 与 Node CJS 均另有 filename → `Module` 缓存；`ModuleId` 是 ESM 注册下标，不是 CJS 模块 ID。缓存复用还受 context/realm 边界、别名规范化和 import/require 条件解析影响。
 
 ---
 
@@ -505,12 +727,12 @@ Node 的 ESM 图由 `ModuleJob` 对象和 V8 `ModuleWrap` 共同表达；CJS 图
 
 ### 4.1 定位
 
-dune 是 V8 + Rust + 自己的 libuv-shaped event loop（`crabuv`）。V8 只提供两个关键回调：
+dune 是 V8 + Rust + 自己的 libuv-shaped event loop（`crabuv`）。此处与加载相关的两个关键 V8 回调是：
 
 - `module_resolve_cb`：`instantiate_module` 时，embedder 必须为每条静态 import 返回一个 `v8::Module`；
 - `host_import_module_dynamically_cb`：`import()` 时，embedder 必须返回一个 Promise。
 
-dune 选择把整个 module 状态机放在 Rust host 里：module cache、依赖树、加载状态、并发去重都由 `src/modules.rs` 和 `src/runtime.rs` 维护。它是本文五个 runtime 中最“手工”的一个，也是最接近 rsvim 当前实现的参考。
+dune 在 Rust host 中维护 module cache、加载依赖树、加载状态和并发去重；V8 仍负责链接和求值的语义状态机。`src/modules.rs` 和 `src/runtime.rs` 是研究其 host 装载流程的入口。
 
 ### 4.2 核心数据结构
 
@@ -683,7 +905,7 @@ t4: fast_forward(root)
 
 `fetch_module_tree()` 则是同步版本：编译当前模块、插入 `ModuleMap`、遍历 request 递归调用自己。它没有 `ModuleGraph`/`pending`，也不维护 `ModuleStatus`，只靠 `by_path.contains_key()` 判重。dune 的 builtin 入口 `src/js/main.js` 就是用它拉起来的。
 
-### 4.3.1 builtin：19 个 JS ESM 模块构成真实依赖图
+#### 4.3.1 builtin：19 个 JS ESM 模块构成真实依赖图
 
 dune 的 builtin 不是 native module，而是 `include_str!` 进二进制的 JS ESM 源文件：
 
@@ -727,7 +949,7 @@ stream -> assert, events
 
 因此 dune 的 builtin 是一张**真实的 builtin 依赖图**，不是“独立小模块的集合”。`fetch_module_tree()` 递归加载依赖，正是为了让 `instantiate_module` 时 `module_resolve_cb` 能在 `module_map` 里找到所有子模块。没有 CJS、没有 npm；bare specifier 只有命中 `CORE_MODULES` 或被 import map 改写后才能解析。
 
-### 4.3.2 resolver 与 loader
+#### 4.3.2 resolver 与 loader
 
 `resolve_import()` 按 specifier 选择 loader：
 
@@ -785,13 +1007,14 @@ import("x")
   └─ 返回 resolver 的 Promise
 ```
 
-`same_origin` 的存在是为了处理“同一个模块被并发 `import()` 多次”的情况：只加载一次，所有 resolver 在根图 ready 后一起 resolve。失败时 `fast_forward_imports()` 会遍历 `kind` 里的 main promise 和 `same_origin`，逐个 reject。
+`same_origin` 的存在是为了处理“同一个模块被并发 `import()` 多次”的情况：只加载一次，所有 resolver 在根图 ready 后一起 resolve。加载任务在 `exception` 中登记失败时，`fast_forward_imports()` 会遍历 main promise 和 `same_origin` 逐个 reject。这不覆盖所有链接/求值失败：实例化失败路径会报告并退出，求值 Promise 则被丢弃。
 
 关键语义差异：
 
 - 动态 import 的 graph 在 `evaluate()` 之后**立即** resolve namespace，不等待 evaluation Promise；
 - 因此如果模块有 TLA，`await import()` 可能在模块执行完成前就返回；
-- 如果访问尚未初始化的 `default`，会得到 `ReferenceError: Cannot access 'default' before initialization`。
+- 访问尚未初始化的导出会触发 TDZ；即使不读取导出，也能观察到 import 已完成但模块的 TLA 后副作用尚未发生；
+- 模块体抛错时，`import()` 也可能先 fulfilled，再由全局未处理 rejection 路径报告错误，调用方的 `catch` 无法收到预期失败。
 
 这正是 §10 中 dune 的实测结果。
 
@@ -849,7 +1072,7 @@ fast_forward(c1):
   c1.deps 不全是 Ready -> c1 保持 Resolving
 ```
 
-结果 `pending` 永远非空，`run_event_loop()` 的 `while ... || self.has_pending_imports()` 永远为真，进程空转。实测 `dune run main7.js`（静态环）10 秒超时；这不是“慢”，而是状态机没有 SCC/环检测。
+结果 `pending` 永远非空，事件循环继续运行。本轮不触发 TDZ 的合法静态环在 3 秒超时后终止（§10）。死锁发生在 host 的 Ready 收敛阶段，尚未调用 V8 `InstantiateModule`；问题不是 V8 缺少环处理。builtin 的同步 `fetch_module_tree` 路径不使用这套 Ready 算法，不能一概称 dune 所有路径都不支持环。
 
 另一个缺陷是 TLA：
 
@@ -857,7 +1080,7 @@ fast_forward(c1):
 let _ = module.evaluate(tc_scope);
 ```
 
-evaluation Promise 被丢弃，`has_pending_imports()` 只检查 `pending` 里是否还有图，不检查 evaluation Promise。因此 TLA 模块的后续执行不会被宿主保活，`import()` 也会在求值完成前 resolve namespace。
+evaluation Promise 被丢弃，`has_pending_imports()` 只检查加载图。V8 的 TLA 仍可由 microtasks 和定时器/I/O 推进，但 evaluation Promise 本身没有被这条 liveness 路径跟踪；`import()` 也没有正确等待它或传播其 rejection。
 
 dune 的 `ModuleStatus` 收敛图（正常路径与环）：
 
@@ -940,39 +1163,13 @@ sequenceDiagram
 
 因此 dune 的 module loading 和 `fs`、`dns`、`net` 共用同一套 async 基础设施；这也解释了为什么它的 loader 可以在 Rust 侧直接调用同步 `fs::read_to_string`，而不会阻塞 JS 线程。
 
-但注意：**QuickJS 的 LLRT/txiki loader 是同步的，Node 主线程 ESM 也是同步的**；dune 是五者中唯一把“读 module 源码”放到线程池的（Deno 的 CLI 侧也有异步装载，但 deno_core 本身用 futures）。
+但注意：**QuickJS 的 LLRT/txiki loader 是同步的，Node 主线程 ESM 也是同步的**；这里确认的是 dune 的这条线程池装载路径；不能仅凭 Deno core 使用 futures，就推断其底层文件/网络操作不使用线程池或异步 I/O。
 
-### 4.8 运行验证
+### 4.8 运行验证与边界
 
-```bash
-# 命名空间身份 / 去重
-dune run main1.js
-# A same-namespace: true true 1 1
+本轮结果及完整脚本见 §10：合法静态环超时；并发 dynamic import 复用 namespace 但提前完成；模块抛错时 import 先成功、随后出现未处理 rejection；省略扩展名与显式扩展名可导致重复实例。
 
-# 动态 import + TLA
-dune run main2.js
-# Uncaught (in promise) ReferenceError: Cannot access 'default' before initialization
-
-# 静态环
-timeout 10 dune run main7.js
-# exit=124（空转，不是报错）
-
-# import.meta
-dune run main4.js
-# D meta: /abs/main4.js false
-```
-
-结论：
-
-- `by_path` + `seen` 能正确去重普通菱形依赖；
-- `Duplicate` + `fast_forward` 不能处理环，环会空转；
-- `evaluate()` 的 Promise 被丢弃，TLA 语义不完整；
-- `import.meta.main` 在 0.11.4 中实测为 `false`，源码里它只依赖 `ModuleMap.main` 的“首次插入且路径存在”规则，实测不能可靠标识入口。
-
-架构特征与代价：
-
-- **优点**：module loading 与 fs/dns/net 共用 crabuv 异步基础设施；不依赖 engine 的 module 生命周期，容易插入自定义错误、日志、缓存；import map/URL/FS 策略集中在一个 Rust 文件里。
-- **代价**：TLA 不被等待，dynamic import 会提前交付 namespace；环依赖会死锁；import attributes、phases、evaluation error、code cache 等语义都要自己补；没有 CJS/npm。
+这些结果分别对应 host 的加载图就绪判定、evaluation Promise 桥接和路径身份规则。修复方向是区分“已获取/编译”与“已求值”，允许加载环闭合后交给 V8 链接，并持续跟踪 evaluation Promise。dune 没有内建 Node `require()`、CJS wrapper 或 npm 包解析器。
 
 ---
 
@@ -1005,7 +1202,7 @@ JS_SetModuleNormalizeFunc2(rt, Some(Self::normalize_raw));
 
 ### 5.2 核心数据结构
 
-LLRT 的 host 侧没有 module 图，只有“名字 → 加载函数/字节码”的映射和 CJS 兼容状态。
+LLRT 没有 dune 式显式加载树，但 host 不只是“名字 → loader”：它还维护 path → module 的 `ModuleCache.esm` 和 CJS 的 `RequireState`。静态 ESM 图在 QuickJS 内部，运行期 require 关系不等于这张静态图。
 
 **(1) 原生模块表**
 
@@ -1028,7 +1225,7 @@ module_loader.with_module(name, M)      // loader 能声明这个 native module
 global_attachment.add_name(name)        // 用户可见 builtin 列表
 ```
 
-`ModuleLoader::load()` 用 `self.modules.remove(name)` 取出函数指针，再调用 `Module::declare_def::<M, _>()`。用 `remove` 而不是 `get` 意味着**同一个 runtime 内第二次 load 同名原生模块会失败**；实际由 QuickJS 的已加载表保证只调用一次。
+默认 native 路径中，`ModuleLoader::load()` 用 `self.modules.remove(name)` 取出函数指针，再调用 `Module::declare_def::<M, _>()`。这是一次性 loader 表项；正常重复请求由 context 的 QuickJS 注册表拦截。不能据此承诺跨 context 或不同 attributes 的重复 native load 总能成功；hook short-circuit 另有分支。
 
 **(2) 字节码缓存**
 
@@ -1106,7 +1303,7 @@ Vm { runtime: AsyncRuntime, ctx: AsyncContext }
       └─ RequireState { cache, exports, progress }    // CJS
 ```
 
-LLRT 的“模块树”因此是**混合节点**的 DAG：同一个 `main.js` 的依赖里，可能同时有 native、bytecode、文件 ESM、CJS 包装器。
+LLRT 的静态依赖图因此可以包含多种节点，并允许环：同一个 `main.js` 的依赖里，可能同时有 native、bytecode、文件 ESM、CJS 包装器。
 
 ```text
 main.js (PackageLoader -> Module::declare)
@@ -1115,13 +1312,13 @@ main.js (PackageLoader -> Module::declare)
   ├─ node:stream    (EmbeddedResolver + EmbeddedLoader -> JS_ReadObject)
   │    ├─ node:events (native)
   │    └─ node:util   (native)
-  ├─ ./cjs.cjs      (PackageResolver + PackageLoader -> 合成 ESM wrapper)
+  ├─ ./cjs.cjs      (PackageResolver + PackageLoader -> 生成的 ESM 源码 wrapper)
   │    └─ require("__cjs:...") -> RequireState.exports
   └─ ./local.js     (PackageResolver + PackageLoader -> ModuleCache -> Module::declare)
        └─ 与 main 共享同一个 JSModuleDef（若再次 import）
 ```
 
-所有边最终都落在 `ctx->loaded_modules` 里的 `JSModuleDef.req_module_entries`；host 侧没有额外的边容器。
+静态 import/export-from 边由 `JSModuleDef.req_module_entries` 表达；执行时的 `require()` 调用通过 `RequireState` 和 loader 桥接，不会自动成为该数组中的静态边。
 
 调用时序：
 
@@ -1149,7 +1346,9 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-  A["import 'x' / require('x')"] --> B["QuickJS js_host_resolve_imported_module"]
+  A["静态 import 依赖 / dynamic import job"] --> B["QuickJS js_host_resolve_imported_module"]
+  REQ["require(x): host 解析、cache/progress 检查"] --> RI["Module::import / JS_LoadModule"]
+  RI --> B
   B --> C{"normalize: tuple Resolver"}
   C --> D["1 ModuleResolver<br/>trim '__cjs:' / 'node:' / '/'"]
   D -->|"name ∈ HashSet"| OK["Ok(name)"]
@@ -1215,12 +1414,12 @@ ModuleLoader::load_func::<D>
        -> JS_NewCModule(ctx, name, eval_fn)
        -> D::declare(&Declarations)
             -> JS_AddModuleExport
-       -> QuickJS 实例化时回调 eval_fn
+       -> QuickJS 求值时回调 eval_fn
             -> D::evaluate(&Ctx, &Exports)
                  -> JS_SetModuleExport
 ```
 
-所以 native module 对 QuickJS 来说就是 C module：不需要源码，不需要 ESM 解析，导出在链接阶段由 engine 绑定。
+所以 native module 对 QuickJS 来说就是 C module：无需解析 JS 源码；declare 提前登记导出名，链接阶段建立绑定，evaluate 回调设置导出值。
 
 **(2) JS builtin + bytecode**
 
@@ -1241,7 +1440,7 @@ LLRT 用两个 magic prefix 把 CJS 塞进 ESM loader：
 | 前缀 | 生成方 | 语义 |
 |---|---|---|
 | `__cjs:` | `require()` | 这次导入来自 CJS；`PackageResolver` 直接放行（不查文件系统），`PackageLoader` 按 ESM 声明，CJS 顶层代码直接执行 |
-| `__cjsm:` | ESM 解析到 CJS 包时 | 强制按 CJS 处理；`PackageLoader` 生成合成 ESM 包装器，内部再 `require("__cjs:...")` |
+| `__cjsm:` | ESM 解析到 CJS 包时 | `PackageLoader` 先 require 执行并发现导出名，再声明调用 require 的 ESM 源码 wrapper |
 
 `require()` 的关键流程：
 
@@ -1262,7 +1461,7 @@ require(x)
   │      poll_timers(...)
   │      ctx.execute_pending_job()
   │    }
-  └─ 从 state.exports[x] 取 CJS 写出的值，合并到占位对象
+  └─ 读取 state.exports / imported namespace，按分支返回值或拷贝属性，写入 cache
 ```
 
 `globalThis.exports` / `globalThis.module.exports` 是一对 Accessor：
@@ -1276,7 +1475,7 @@ get/set exports
 
 因此 `.cjs` 文件被当作 ESM 执行时，`module.exports = ...` 不会写入真正的 CommonJS 包装函数，而是写入按模块名索引的全局存储。这是 LLRT 能用 ESM loader 承载 CJS 语义的核心技巧。
 
-`import` 一个 CJS 文件时，`PackageLoader::load_cjs_module()` 生成：
+`import` 一个 CJS 文件时，`PackageLoader::load_cjs_module()` **先同步调用 `require("__cjs:" + name)` 执行 CJS 并枚举导出名**，再生成下面的 ESM 源码 wrapper。wrapper 求值时再次调用 require，通常命中结果缓存。CJS 副作用因此可能发生在 loader 阶段，而非等 ESM wrapper 求值才首次发生：
 
 ```js
 const value = require("<name>");
@@ -1285,7 +1484,11 @@ const { a, b } = value;
 export { a, b };
 ```
 
-具名导出来自 `Object.keys(value)`，不是静态分析，因此不是 live binding。
+具名导出来自运行时对象 keys；`const { a, b } = value` 保存当时的属性值，不会持续读取 CJS 对象属性。`default` 的 `value.default || value` 规则也不同于 Node 将整个 `module.exports` 作为 default 的常规行为。
+
+**`require(ESM)` 也不是直接返回原始 namespace。** `require.rs` 会根据 CJS exports、default export 类型等分支拷贝属性或合并到 default 对象。以 `export let x = 1; export function inc() { x++; }` 为例，require 返回对象的 `x` 在 `inc()` 后仍可为 1；Node/Deno namespace 则读到 2（§10）。
+
+同一目标经 import/require 加载时，`PackageLoader` 的 `ModuleCache.esm[path]` 可复用 module，`RequireState.cache` 可复用 require 返回值。但两者不是同一种缓存，返回对象也不必等于 namespace。import/require 条件还可能解析到不同文件。
 
 ### 5.6 QuickJS API 调用清单
 
@@ -1299,14 +1502,14 @@ export { a, b };
 | `JS_AddModuleExport` | `Declarations::declare` | 声明 native 导出 |
 | `JS_SetModuleExport` | `Exports::export` | 设置 native 导出 |
 | `JS_EvalFunction` | `Module::eval` | link + evaluate |
-| `JS_LoadModule` | `Module::import` | `require()` / dynamic import |
+| `JS_LoadModule` | `Module::import` | require 的 host 入口；JS `import()` 则经 `js_dynamic_import_job` 调内部加载函数 |
 | `JS_GetImportMeta` | `Module::meta` | `import.meta.url` |
 | `JS_ExecutePendingJob` | `Ctx::execute_pending_job` | 泵 Job queue |
 | `JS_GetScriptOrModuleName` | `module::init` 的 exports accessor | 当前模块名 |
 | `JS_WriteObject` | build.rs `module.write` | 生成 `.lrt` |
 | `JS_GetModuleNamespace` | `Module::namespace` | namespace |
 
-`require()` 的泵只推进 QuickJS job queue，不推进 Tokio I/O future。这是同步 CJS 与异步 API 之间的一个真实边界：如果 CJS 模块内部依赖一个 Tokio 驱动的 future，`require()` 期间它不会前进。
+`require()` 的同步泵调用 `poll_timers()` 和 `ctx.execute_pending_job()`，没有 poll rquickjs 的通用 future 调度器。因此 Promise jobs 与该定时器路径可推动 TLA；如果完成还依赖异步 future 经调度器回到 JS，这个循环不能保证进展，可能一直等待。不能把它视为 Node/Deno 的同步 ESM 检查，也不能视为完整异步 event loop。
 
 ### 5.7 异步模型
 
@@ -1316,26 +1519,15 @@ export { a, b };
 - LLRT 的 `#[tokio::main]` 提供 Tokio 给网络/定时器等应用 API；
 - `Ctx::spawn` 把 future 推入 rquickjs 调度器，`spawn_exit` 负责把结果回传/错误上报。
 
-所以 LLRT 的“异步”在 module 层几乎不存在：`import` 的 I/O 是阻塞的，`require()` 的泵是同步的；只有模块内的 TLA 和 JS 层 Promise 由 QuickJS job queue 推进。
+模块源码 I/O 是阻塞的，但 dynamic import 的 job 调度和 TLA 求值仍是异步语义。普通运行由 `AsyncRuntime::idle()` 推进 jobs 与 futures；嵌套的同步 require 泵只覆盖 jobs 和定时器，推进范围更小。
 
 ### 5.8 运行验证
 
-```bash
-llrt main1.js        # A same-namespace: true true 1 1
-llrt main2.js        # B tla: slow-done true eval:slow:start,eval:slow:end
-llrt main3.js        # C cycle error: ReferenceError c1v is not initialized
-llrt main4.js        # D meta: file:///abs/main4.js undefined（无 import.meta.main）
-llrt llrt1.js        # require("node:fs") === import fs -> true
-llrt llrt_bridge.js  # cjs eval count: 1；c === m.default -> true
-llrt cjsesm.cjs      # require(esm) 可用，esm eval count: 1
-```
+本轮 §10 验证：合法 ESM 环正常；并发 import 等待 TLA；求值错误通过 import Promise reject；`require(ESM)` 的属性拷贝导致测试中的 `x` 保持旧值；定时器驱动的 TLA 可以在 require 的同步泵中完成。
 
-结论：
+循环 require 的部分导出也有差异：Node/Deno 将模块当前 exports 暴露给环中调用者；LLRT 的 `progress` 占位对象与 `state.exports` 分开，提前写入 exports 的属性可能尚未复制到占位对象。本轮 A 先写 `exports.a = "a"`、B 在环中读取它时，Node/Deno 得到 `"a"`，LLRT 得到 `undefined`（§10）。
 
-- 模块树完全在 QuickJS，host 只维护“名字 → 加载器”的映射；
-- native builtin 与 `require` 命中的是同一份 exports；
-- CJS 由两个前缀 + `RequireState` 桥接，`import` CJS 与 `require` CJS 复用同一模块实例；
-- `import.meta` 只有 `url`，没有 `main`/`resolve`。
+这些结论不能扩大为“完全兼容 Node require”。例如 `node:module` 的 `createRequire` 当前只是返回全局 require，没有建立 Node 式绑定指定 base URL 的新函数，见 `llrt_modules/src/module/mod.rs::create_require`。
 
 ---
 
@@ -1465,11 +1657,11 @@ flowchart TD
 
 注意：
 
-- `import './x.json'` 不带 `with { type: 'json' }` 会走 JS 编译并失败；JSON 必须显式 attributes。
+- 通常以 `with { type: 'json' }` 请求 JSON。`detect_module_type` 在 attributes 为 `undefined` 时选 JS；若传入 attributes 对象但 `type` 不是字符串，则按 `.json` 后缀判断，不能把所有缺少 type 的请求都描述为相同分支。
 - `tjs_module_attr_checker` 只允许键 `type`，值不校验。
 - 文件/HTTP 都是同步阻塞；loader 回调返回 `JSModuleDef*`，本身无法 await。
 
-### 6.4 QuickJS 的 DAG、链接与求值
+### 6.4 QuickJS 的依赖图、链接与求值
 
 txiki 的“树”就是 QuickJS 的图：
 
@@ -1490,10 +1682,10 @@ shared.req_module_entries -> *util
 ```text
 js_resolve_module(m)
   if m->resolved: return
+  m->resolved = true          // 必须在递归前设置，截断循环解析
   for each rme in m->req_module_entries:
       rme->module = js_host_resolve_imported_module_atom(m->name, rme->name, rme->attrs)
       js_resolve_module(rme->module)
-  m->resolved = true
 ```
 
 `js_host_resolve_imported_module` 的顺序是：normalize → 查 `ctx->loaded_modules` → 未命中才调 loader。模块在解析依赖前已经插入 `loaded_modules`，所以环在 resolve 阶段自然闭合。
@@ -1543,7 +1735,7 @@ job: js_dynamic_import_job
        -> evaluation promise.then -> resolve(namespace)
 ```
 
-所以 `import()` 的“异步”只是**调度点**异步（job queue），I/O 仍然同步。
+这里的源码 I/O 仍然同步；异步边界既包括 import job 的调度，也包括之后等待 evaluation Promise/TLA。宿主仍需推进 jobs 和 TLA 所依赖的定时器/网络事件。
 
 QuickJS API 使用清单：
 
@@ -1628,22 +1820,9 @@ sequenceDiagram
 
 ### 6.7 运行验证
 
-```bash
-tjs run main1.js     # A same-namespace: true true 1 1
-tjs run main2.js     # B tla: slow-done true eval:slow:start,eval:slow:end
-tjs run main3.js     # C cycle error: ReferenceError c1v is not initialized
-tjs run main4.js     # D meta: file:///abs/main4.js true
-tjs run internal.js  # internal blocked: ReferenceError module 'tjs:internal/core' is not exposed to user code
-tjs run stdlib.js    # tjs:path a/b function
-tjs run --import-map importmap.json map.js  # mapped ok 1
-```
+本轮运行本地 `build/tjs`（v26.6.0），并核查 `deps/quickjs` 实际子模块源码。§10 的 namespace 复用、合法 ESM 环、dynamic import 等待 TLA、求值异常 rejection 四组实验均符合上述路径。
 
-结论：
-
-- host 没有 module 图，只有名字规范化和字节码/源码加载；
-- `tjs:internal/*` 的可见性由 normalizer 的前缀检查控制；
-- import map 是 JS 闭包，C 侧只调用；
-- 文件/HTTP 加载同步，`import()` 只是 job 化调度。
+没有内建 Node require/CJS loader。`import()` 等待 evaluation 的合约由 QuickJS 实现；进程是否继续运行还取决于 txiki 的 jobs 与 libuv 活跃工作，不能仅凭一个 pending Promise 推断进程保活。
 
 ---
 
@@ -1651,7 +1830,7 @@ tjs run --import-map importmap.json map.js  # mapped ok 1
 
 ### 7.1 两层分工
 
-Deno 同时支持 Web API、npm、JSR、Node compat、TypeScript、permissions 和 snapshot，因此它不是一张图，而是两张：
+Deno 的 ESM 装载可先从 CLI 构建图和 core 注册表两层理解；此外还有 V8 内部语义图，以及 Node compat 的 CJS loader/cache（§7.10）。下面两层不是 Deno 全部模块状态的清单：
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -1831,15 +2010,14 @@ poll_next()
 
 register_and_recurse(source)
   ├─ check redirect / get_id() 去重
-  ├─ v8::script_compiler::compile_module2 / compile_module
-  ├─ module.get_module_requests()
-  ├─ 每条 request:
-  │    ├─ loader.resolve_with_scope(...)
-  │    ├─ 构造 ModuleReference
-  │    ├─ visited / visited_as_alias 命中 -> skip
-  │    ├─ get_id() 已注册 -> already_registered 队列
-  │    └─ 否则 needs_load -> 包装 future 推入 pending
-  └─ create_module_info(id = handles.len())
+  ├─ new_module_with_pending:
+  │    ├─ compile_module2 / compile_module
+  │    ├─ get_module_requests → resolve_with_scope → ModuleReference
+  │    └─ create_module_info(id = handles.len())，登记自身
+  └─ finalize_module → register_and_recurse_inner:
+       ├─ visited / visited_as_alias 命中 -> skip
+       ├─ get_id() 已注册 -> already_registered 队列
+       └─ 否则 needs_load -> 包装 future 推入 pending
 ```
 
 去重键是 `(specifier, requested_module_type)`，不是原始字符串：
@@ -1950,7 +2128,7 @@ EventLoopPendingState {
 }
 ```
 
-这三项都参与 `is_pending()`，所以有在飞的 module loading/evaluation 时 Deno 不会退出。TLA 的 Promise 被显式跟踪，因此 `import()` 会等求值完成再 resolve namespace。
+这三项参与 `is_pending()`，让 event loop 跟踪模块工作；但不意味着 pending evaluation 会无限保活。没有可推进的工作时，`jsruntime.rs` 还检测 stalled TLA / evaluation deadlock 并报错。正常 dynamic import 路径等待 evaluation Promise 再 resolve namespace。
 
 动态 import 的三段式流水线：
 
@@ -2109,36 +2287,58 @@ fn validate_ext_module_import(...) {
 
 ### 7.8 tokio 的角色
 
-Deno 的 module loading **本身不用 tokio 调度**：
+Deno core 的模块任务主要组织为 futures；这与 CLI 使用 Tokio 驱动外部 I/O 不矛盾：
 
 - `RecursiveModuleLoad` 用 `FuturesUnordered` + `StreamFuture`；
 - 动态 import 的 prepare future 也是 `FuturesUnordered`；
 - `module_waker: AtomicWaker` 把 V8 promise 的回调接回事件循环；
 - 求值用 `tokio::sync::oneshot` 把 V8 Promise 桥回 Rust future；
-- CLI 的 JS 跑在 **current-thread tokio runtime** 上，V8 永远在 `block_on` 的线程执行；`spawn_blocking` 只用于 swc 解析等阻塞工作。
+- CLI 主运行路径使用 current-thread Tokio runtime，V8 在其所属线程执行；底层网络、文件获取和转译采用什么调度方式，应继续沿具体 loader 实现分析，不能仅由 `FuturesUnordered` 推断。
 
-所以 Deno 的“异步”是 **futures + waker** 驱动，不是“每个 import 一个 tokio task”。
+`FuturesUnordered` 描述 core 如何并发 poll 装载任务，不代表每个 import 都创建独立 Tokio task；同步 require 的 `op_import_sync` 还使用阻塞等待装载的特殊路径。
 
 ### 7.9 运行验证
 
-```bash
-deno run --quiet main1.js   # A same-namespace: true true 1 1
-deno run --quiet main2.js   # B tla: slow-done true eval:slow:start,eval:slow:end
-deno run --quiet main3.js   # C cycle error: ReferenceError Cannot access 'c1v' before initialization
-deno run --quiet main4.js   # D meta: file:///abs/main4.js true
-deno run --quiet deno_ext.js
-# ext blocked: TypeError Importing ext: modules is only allowed from ext: and node: modules...
-# node:fs facade: function false
-deno info --json main1.js   # 输出 roots/modules/dependencies 图
+本轮本地 debug 构建 Deno 2.9.8 的结果见 §10：合法静态环正常；dynamic import 等待 TLA 并传播求值异常；require 同步 ESM 的导出仍能反映绑定变化；require 含 TLA 的图报 `ERR_REQUIRE_ASYNC_MODULE`。
+
+### 7.10 Node compat：CJS loader 与双向 ESM 桥接
+
+`ext/node/polyfills/01_require.js` 实现独立的 Node 风格 CJS loader。它不把所有 CJS 模块都直接作为 core `ModuleInfo` 节点管理：
+
+```text
+CJS Module
+ ├─ id / filename / path
+ ├─ exports / loaded
+ ├─ parent / children / paths
+ └─ Module._cache[filename] → Module
+
+require(CJS)
+  → Module._load → _resolveFilename
+  → 命中 cache：返回 exports（环中可返回尚未完成的 exports）
+  → 未命中：new Module，先写入 cache
+  → module.load → 扩展名/格式处理 → _compile
+  → core.compileFunction(source, ..., [exports, require, module, __filename, __dirname])
+  → compiledWrapper.call(exports, require, module, filename, dirname)
+  → 返回 module.exports；失败时删除未完成的缓存项
 ```
 
-结论：
+`op_require_*` 提供文件、包信息与路径能力；`op_require_read_file` 经过权限检查和 `NodeRequireLoader` 读取源码。require 因而不是绕过 Deno 权限模型的入口。
 
-- 运行时图是“双索引 + 句柄分离”：`ModuleId` 下标、`by_name` 名字索引、`handles` 独立数组；
-- 装载是 futures 并行 + `visited` 两级去重；
-- 链接通过 `instantiate_module2` 的 resolve/source 回调把 `ModuleInfo.requests` 映射回 V8 handle；
-- TLA 由 `pending_dyn_mod_evaluations` / `pending_tla_waiters` 显式跟踪；
-- CLI 的 `deno_graph` 与运行时 `ModuleMap` 是两张不同的图。
+**CJS require ESM：** `loadESMFromCJS` 将 filename 转成 URL，调用 `op_import_sync`（hook 提供源码时可走 `op_import_sync_with_source`）。core 装载/实例化图，检查 `is_graph_async()`，同步求值并返回 namespace/facade。异步图被拒绝，即使此前曾通过 import 完成 TLA 也一样；JS 层将对应错误映射为 `ERR_REQUIRE_ASYNC_MODULE`。`import_sync_eval_stack` 与 V8 状态共同检测跨 CJS/ESM 的重新进入环。存在 `'module.exports'` 导出时，JS bridge 可选它作为 require 返回值。
+
+**ESM import CJS：** `libs/node_resolver/analyze.rs::exports_to_wrapper_module` 根据静态分析所得导出名生成 ESM 源码：
+
+```js
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const mod = require("/absolute/path/module.cjs");
+export default mod;
+// 实际生成器还处理具名导出、'module.exports' 导出和 main 入口。
+```
+
+wrapper 的 ESM 身份由 core ModuleMap 管理，CJS 实例由 `Module._cache` 管理。它与 Node synthetic module 的实现形态不同，但都需要连接 ESM 和 CJS 两套缓存；与 LLRT 先执行 CJS 枚举 keys 的策略也不同。
+
+证据：`ext/node/polyfills/01_require.js::{Module._load, wrapSafe, loadESMFromCJS}`、`ext/node/ops/require.rs::op_require_read_file`、`libs/core/ops_builtin.rs::op_import_sync`、`libs/node_resolver/analyze.rs::exports_to_wrapper_module`。
 
 ---
 
@@ -2150,14 +2350,18 @@ Node 的独特之处：CJS 是原生起点，ESM 是后加并通过 bridge 兼�
 
 ```text
 ESM:
-  import / import()
-    -> V8 host callback
-    -> src/module_wrap.cc
-    -> lib/internal/modules/esm/utils.js
-    -> ModuleLoader.import
-    -> ModuleJobSync / ModuleJob
-    -> ModuleWrap (C++)
-    -> v8::Module
+  static import
+    -> 编译得到 ModuleRequest
+    -> ModuleJob.syncLink/link -> getOrCreateModuleJob
+
+  import()
+    -> V8 dynamic callback -> src/module_wrap.cc -> esm/utils.js
+    -> ModuleLoader.import -> getOrCreateModuleJob
+
+  共同后续:
+    -> ModuleJobSync / ModuleJob + loadCache
+    -> ModuleWrap -> V8 instantiate / evaluate
+    -> static 绑定与依赖求值；dynamic Promise 完成
 
 CJS:
   require()
@@ -2169,7 +2373,7 @@ CJS:
     -> execute
 ```
 
-2026 快照的一个重要变化：**主线程上的 ESM 入口统一使用 `ModuleJobSync`**（`loader.js:620-622`），同步 link，无 TLA 时同步 evaluate；只有 `kRequireInImportedCJS` 等少数路径仍用异步 `ModuleJob`。
+2026 快照的一个重要变化：**主线程普通 ESM 入口主要使用 `ModuleJobSync`**（`loader.js:620-622`），普通路径同步 link，无 TLA 时同步 evaluate；`kRequireInImportedCJS` 等特殊路径仍使用 `ModuleJob`，该类在主线程也会调用 `syncLink`。不能只凭类名判断每一步是否异步。
 
 ### 8.2 ESM 数据结构
 
@@ -2265,7 +2469,7 @@ ModuleLoader
 
 ModuleJobBase
  ├─ url, loader, importAttributes, phase, isMain, inspectBrk
- ├─ ModuleJob: module | modulePromise, linked(Promise), instantiated, commonJsDeps
+ ├─ ModuleJob: module | modulePromise, linked(Promise 或数组), instantiated, commonJsDeps
  └─ ModuleJobSync: module(ModuleWrap), linked[], type, commonJsDeps
 
 ModuleWrap (C++ BaseObject)
@@ -2277,28 +2481,25 @@ ModuleWrap (C++ BaseObject)
  └─ linked_module_wraps_: std::vector<ModuleWrap*>
 ```
 
-### 8.3 ESM 加载流程
+### 8.3 ESM 加载流程：区分静态请求与 dynamic callback
 
 ```mermaid
 flowchart TD
-  A["import 'x' / import('x')"] --> B["V8 host callback<br/>src/module_wrap.cc"]
-  B --> C["JS importModuleDynamicallyCallback<br/>esm/utils.js"]
-  C --> D["ModuleLoader.import(specifier, parentURL)"]
-  D --> E["getOrCreateModuleJob"]
-  E --> F["resolveSync / #resolve<br/>defaultResolve"]
-  F --> G{"loadCache.get(url, type)?"}
-  G -- hit --> H["复用 ModuleJob"]
-  G -- miss --> I["loadAndTranslate"]
-  I --> J["defaultLoadSync<br/>fs.readFileSync"]
-  I --> K["translator:<br/>module / commonjs / json / builtin / wasm"]
-  K --> L["new ModuleWrap"]
-  L --> M["loadCache.set(url, type, job)"]
-  H --> N["job.run() / runSync()"]
-  M --> N
-  N --> O["module.instantiate()<br/>v8::Module::InstantiateModule"]
-  O --> P["module.evaluate() / evaluateSync()"]
-  P --> Q["module.getNamespace()"]
+  S["static import: 已编译模块的静态请求"] --> SL["ModuleJob.syncLink / link<br/>getModuleRequests()"]
+  D["JS import(expr)"] --> DC["V8 dynamic callback<br/>esm/utils.js → ModuleLoader.import"]
+  SL --> J["getOrCreateModuleJob<br/>resolve → loadCache 查找"]
+  DC --> J
+  J -->|"miss"| L["loadAndTranslate<br/>源码/格式 → ModuleWrap"]
+  L --> N["创建 job；登记缓存并递归链接请求"]
+  J -->|"hit"| C["复用 job"]
+  N --> I["入口 job 组织 instantiate<br/>V8 InstantiateModule + resolve callback"]
+  C --> I
+  I --> E["V8 Evaluate<br/>同步图或异步 TLA 图"]
+  E --> SP["static: 依赖者按引擎规则求值"]
+  E --> DP["dynamic: 等待 job.run()<br/>成功返回 namespace；失败 reject"]
 ```
+
+图中两个入口共享 job/cache，但静态 import 不触发 dynamic callback。`syncLink` 先临时登记自身，再递归获取依赖 job，最终 `ModuleWrap.link` 保存依赖 wrappers；之后 `instantiate()` 才调用 V8 的链接语义。`ModuleJobSync` 的加载/链接同步，`run()` 仍可 await TLA；`runSync()` 则拒绝异步图。
 
 `resolve` 的关键路径：
 
@@ -2324,24 +2525,24 @@ defaultResolve
 - 判定为 `commonjs` 时，async 版本会把 source 置 null，让 CJS loader 自己重新读；
 - translator 是 `SafeMap`：`module`、`commonjs-sync`、`require-commonjs`、`builtin`、`json`、`wasm`、`addon` 等。
 
-`ModuleJob` 的状态：
+以下是 **host job 的编排阶段**，不是 V8 `GetStatus()` 枚举：
 
 ```mermaid
-stateDiagram-v2
-  [*] --> Uninstantiated: new ModuleJobSync / ModuleJob
-  Uninstantiated --> Linked: syncLink / link<br/>依赖 job 递归
-  Linked --> Instantiated: module.instantiate()
-  Instantiated --> Evaluated: evaluateSync（无 TLA）
-  Instantiated --> Evaluating: evaluate()（有 TLA / async graph）
-  Evaluating --> Evaluated: evaluation Promise settle
-  Linked --> Errored: link 失败
-  Instantiated --> Errored: instantiate 失败
-  Evaluating --> Errored: evaluate 失败
+flowchart LR
+  A["load / translate"] --> B["link dependency wrappers"]
+  B --> C["V8 instantiate"]
+  C --> D{"异步图?"}
+  D -->|"否"| E["evaluateSync"]
+  D -->|"是，import 路径"| F["evaluate + await Promise"]
+  D -->|"是，require 路径"| X["ERR_REQUIRE_ASYNC_MODULE"]
+  E --> G["交付结果"]
+  F --> G
 ```
 
-- `ModuleJobSync`：`syncLink` → `instantiateSync` → 无 TLA 时 `evaluateSync`；有 TLA 时退回异步 `evaluate`；
-- `ModuleJob`：`link`/`instantiate`/`evaluate` 都是 Promise 链，用 `instantiated` 字段去重；
-- 环处理：`syncLink` 先把自身写入 `loadCache`，再递归 link；`ModuleJob` 的 `#asyncInstantiate` 会先 flatten 整个依赖图，避免环导致死锁。
+- `ModuleJobSync.run()` 在同步图中调用 `evaluateSync`，异步图中等待 `evaluationPromise`；`runSync()` 检查 `hasAsyncGraph` 后拒绝 TLA。
+- `ModuleJob` 在 loader worker 可使用异步链接；主线程路径也可使用同步链接。
+- host 通过先登记 job 避免加载环重复创建实例；V8 处理最终绑定、循环求值与 TDZ。异步 job 的 instantiate 流程还会遍历依赖，避免 host 等待链因环互相等待。
+- V8 `Evaluated` 可能仍对应 pending TLA，不能代替 `evaluationPromise` 判断完成，见 §2.1。
 
 ### 8.4 CJS 数据结构与 require 流程
 
@@ -2443,7 +2644,9 @@ Node 有三条桥：
 2. **`require` 一个 ESM 文件**：`importSyncForRequire()` 复用 `ModuleJobSync`，有 TLA 就抛 `ERR_REQUIRE_ASYNC_MODULE`；
 3. **loader hooks**：`module.registerHooks()` 是同步 in-thread hook（CJS/ESM 共用全局 `resolveHooks/loadHooks`）；`module.register()` 是异步 loader hook worker，v26 已 runtime deprecated。
 
-CJS wrapper 的导出是“静态分析 + `default` + `module.exports`”的快照，不是 live binding；动态属性不会出现在 named exports 里。
+CJS wrapper 的导出名由静态分析加上 `default` / `module.exports` 确定；具名导出的值在 wrapper 求值时设置，后续 CJS 属性赋值不自动更新这些值。default 通常引用实际 `module.exports` 对象，因此对象内部变化仍可见。运行期才添加且未被分析发现的属性不会自动变成具名导出。
+
+`require(ESM)` 则不同：通常返回 namespace 或保留绑定关系的 facade，也支持 ESM 显式导出名为 `'module.exports'` 的互操作形式。它不是把所有导出属性复制到普通对象；本轮 live binding 测试与 LLRT 有明显差异（§10）。
 
 ### 8.7 builtin：`BuiltinModule` map + ESM facade
 
@@ -2482,12 +2685,13 @@ translator builtin
 
 ```text
 require('fs')              -> BuiltinModule.exports（CJS 对象）
-import fs from 'node:fs'   -> getESMFacade()（ESM namespace）
+import fs from 'node:fs'   -> facade 的 default binding（通常是该 exports 对象）
+import * as ns from 'node:fs' -> facade 的 namespace
 ```
 
 ### 8.8 libuv 的角色：同步 fs，不经过事件循环
 
-Node 主线程的 module 加载全程同步阻塞：
+当前源码的默认主线程文件加载路径同步阻塞；hooks 和 loader worker 是另行配置的路径：
 
 ```text
 ESM: getSourceSync -> loaderMethods.readFileSync -> fs.readFileSync
@@ -2513,9 +2717,9 @@ POST:
 - `loop` 甚至可以是 `NULL`；
 - 不 submit 到线程池；
 - 不注册 req 到 loop；
-- 不占用事件循环。
+- 不创建异步 I/O 请求，但会占用调用线程、阻塞该线程的事件循环进展。
 
-唯一真正跨线程的是 **loader hooks**：
+模块加载的另一条可选跨线程路径是 **loader hooks**：
 
 ```text
 module.register()
@@ -2529,411 +2733,241 @@ worker 与主线程的 MessagePort 收发走 libuv 的 async handle，但主线�
 
 ### 8.9 运行验证
 
-```bash
-node main1.js    # A same-namespace: true true 1 1
-node main2.js    # B tla: slow-done true eval:slow:start,eval:slow:end
-node main3.js    # C cycle error: ReferenceError Cannot access 'c1v' before initialization
-node main4.js    # D meta: file:///abs/main4.js true
-
-node bridge.mjs  # node cjs bridge: true 2 undefined 1
-                 # （c === m.default，__cjsEval === 1）
-node reqesm.cjs  # node require(esm): 1 1 1
-node reqtla.cjs  # require TLA: ERR_REQUIRE_ASYNC_MODULE ...
-
-node hook.mjs    # [["resolve","./a.js"],["load","a.js"]]
-```
-
-结论：
-
-- ESM 状态机在 JS，C++ 只是 V8 trampoline；
-- `loadCache` 是 `url × type` 两级，`resolveCache` 单独一套；
-- 主线程同步装载，loader hook worker 是唯一的异步/跨线程路径；
-- CJS 与 ESM 各有一套缓存和环处理，通过 synthetic ModuleWrap 与 `require(esm)` 桥接。
+本轮安装的 Node v24.14.0 验证了合法 ESM 环、dynamic import 的 TLA/错误语义、require ESM 的绑定更新，以及 require TLA 的错误（§10）。这些行为测试不能证明当前仓库 HEAD 的 `ModuleJobSync` 调度实现；该实现结论来自上面的源码路径。
 
 ---
 
 ## 9. 横向对比
 
-### 9.1 所有权光谱
+### 9.1 三种 API 共享什么，又在哪里分叉
 
-```text
-host/embedder-owned                       engine/core-owned                  JS-owned
+static import 和 dynamic import 通常共享 ESM resolver、实例注册表、引擎链接与求值，但静态请求来自编译结果，dynamic 请求来自运行期表达式。`require()` 是另一套返回值和同步性合约；Node/Deno 使用独立 CJS loader，LLRT 将其接到 QuickJS ESM 加载机制。
 
-dune                                      Deno (deno_core)
-                                          LLRT / txiki (QuickJS)              Node ESM
+| API | 发现依赖 | 结果 | 加载 I/O 与 API 同步性 |
+|---|---|---|---|
+| static import | 编译时的 ModuleRequest / JSReqModuleEntry | import binding；模块体按依赖求值规则执行 | host 可以异步预加载；声明本身不返回 Promise |
+| dynamic import | 执行 `import(expr)` | Promise，普通成功路径以 namespace 完成 | Promise API 不等于 I/O 非阻塞；LLRT/txiki 和当前 Node 默认文件加载仍同步 |
+| require | 执行函数调用 | 通常是 `module.exports`；ESM 互操作有例外 | 同步交付结果；LLRT 内部同步等待 Promise 的行为不同于 Node/Deno |
 
-  自己写图                                  引擎/核心写图                         JS 写图
-  自己写状态机                              自己只写 resolver/loader             C++ 只做 trampoline
-```
+### 9.2 static import：加载与链接路径
 
-具体到 module 生命周期的每一段：
+| Runtime | 静态请求如何展开 | 身份与缓存 | 链接/求值 |
+|---|---|---|---|
+| Node | `ModuleJob.syncLink/link` 遍历 `ModuleWrap.getModuleRequests()`，递归创建/复用 job；当前主线程普通文件加载同步 | `loadCache[url][type]`；resolve cache 分开 | `ModuleWrap` 调 V8；V8 处理绑定、SCC、TLA |
+| Deno | CLI graph 准备源码；core `RecursiveModuleLoad` 用 futures 装载依赖 | `by_name[(name,type)]`、alias、`handles[id]`；visited 用于本次装载 | core 调 V8；额外跟踪 evaluation Promise |
+| dune | 用户入口通过 crabuv worker 获取源码，compile 后建立 `EsModule` 加载树；builtin 有同步递归路径 | `by_path`、`seen`、`pending` | `fast_forward` 放行后调用 V8；用户路径的环会卡在放行前 |
+| LLRT | QuickJS compile/resolve 递归调用 resolver/loader 链；文件读取同步 | QuickJS 注册表 + host `ModuleCache.esm[path]` | QuickJS 链接、SCC、求值 |
+| txiki | QuickJS 调 C normalizer/loader；文件/HTTP 读取阻塞 | QuickJS `loaded_modules` | QuickJS 链接、SCC、求值 |
 
-| 阶段 | dune | LLRT | txiki | Deno | Node |
-|---|---|---|---|---|---|
-| resolve | host Rust | QuickJS resolver 链 | QuickJS normalizer | `deno_core` loader + CLI resolver | JS `defaultResolve` |
-| load | crabuv worker | native / bytecode / fs（同步） | C / bytecode / HTTP / fs（同步） | `deno_graph` + emit cache | `readFileSync` / hooks |
-| compile | host V8 | QuickJS | QuickJS | CLI transpile + `deno_core` compile | translators + V8 |
-| graph | host `ModuleMap` tree | engine | engine | CLI graph + `ModuleMap` | JS `ModuleJob` |
-| link | host | engine | engine | `deno_core` | JS + V8 |
-| evaluate | host | engine | engine | `deno_core` | JS + V8 |
-| builtin | JS ESM | native + bytecode | C + bytecode | ESM extension | `BuiltinModule` map |
-| CJS | 无 | 部分 | 无 | Node compat | 原生 |
+同样叫 compile，V8 `CompileModule` 与 QuickJS `JS_Eval(MODULE | COMPILE_ONLY)` 的依赖加载边界不同，见 §2。host 要保证重复路径返回已有实例，但不需要重新实现引擎的 ESM SCC 算法。
 
-### 9.2 数据结构对照
+### 9.3 dynamic import：Promise 由谁完成
 
-| 维度 | dune | LLRT | txiki | Deno | Node |
-|---|---|---|---|---|---|
-| 全局 registry | `ModuleMap` | `ctx->loaded_modules` | `ctx->loaded_modules` | `ModuleMapData` | `loadCache` + `Module._cache` |
-| 节点 | `EsModule` | `JSModuleDef` | `JSModuleDef` | `ModuleInfo` + handle | `ModuleJob` + `ModuleWrap`；CJS `Module` |
-| 边 | `Vec<Rc<RefCell<EsModule>>>` | `JSReqModuleEntry[]` | `JSReqModuleEntry[]` | `Vec<ModuleRequest>` | `ModuleJob.linked`；`module.children` |
-| 状态 | `ModuleStatus` | `JSModuleStatus` | `JSModuleStatus` | `pending_*` + V8 status | job 状态 + V8 status |
-| 去重 | path + `seen` | name + attrs | name + attrs | `(name,type)` + alias | `url × type`；CJS filename |
-| 异步装载 | crabuv `spawn` | 同步 | 同步 | `FuturesUnordered` | 同步（主线程）/ worker hooks |
-| TLA 跟踪 | 不跟踪 | engine | engine | `pending_dyn_mod_evaluations` | `IsGraphAsync` + evaluate Promise |
-| builtin 表 | `CORE_MODULES: HashMap` | `ModuleResolver` HashSet + phf | `builtins[]` 数组 | `Extension` | `BuiltinModule.map` |
+| Runtime | 入口与加载 | 完成条件 | 与 static import 的共享部分 |
+|---|---|---|---|
+| Node | V8 callback → `ModuleLoader.import()` → job | await `job.run()`，失败 reject，成功交付 namespace | 相同 ESM job/cache/translator |
+| Deno | V8 callback → core 的 prepare/load/evaluate 队列；已有实例有快路径 | 跟踪 evaluation Promise 和 TLA waiters | core ModuleMap、loader、V8 module |
+| dune | V8 callback → `ModuleGraph::dynamic_import`；同 root resolver 放入 `same_origin` | 当前实现 evaluate 后直接 resolve，未等待完成且未正确传播求值 rejection | `ModuleMap`、加载任务与 V8 module |
+| LLRT | QuickJS `js_dynamic_import` 创建 Promise 并排 job | job 加载后等待 evaluation Promise | QuickJS 模块注册表和 resolver/loader 链 |
+| txiki | 同一 QuickJS job 机制，host 驱动 jobs/libuv | 等待 evaluation Promise | QuickJS 注册表和 C normalizer/loader |
 
-### 9.3 引擎 API 对照
+取得 namespace、加载图 Ready、V8 公开状态 `Evaluated` 都不能独立证明 TLA 已完成。**load Promise、evaluation Promise、用户 import Promise**应分别识别；dune 将后两者的完成时机混在一起，是其提前成功和错误传播问题的原因。
 
-| 能力 | V8 | QuickJS |
+### 9.4 require：独立 CJS loader 与 ESM 桥接
+
+| Runtime | CJS 执行/缓存 | require ESM | TLA |
+|---|---|---|---|
+| Node | `Module._load`、函数 wrapper、`Module._cache[filename]`；先入缓存再执行 | `importSyncForRequire` 接入 ESM job；通常返回 namespace/facade，也支持 `'module.exports'` 导出 | `hasAsyncGraph` 检查整个图并拒绝 |
+| Deno | JS Node compat loader、`core.compileFunction` wrapper、`Module._cache`；Rust ops 提供路径/权限/I/O | `loadESMFromCJS` → `op_import_sync` → core ModuleMap | `is_graph_async()` 拒绝；映射为 `ERR_REQUIRE_ASYNC_MODULE` |
+| LLRT | CJS 源码进入 ESM 编译；全局 exports accessor；`RequireState.cache/exports/progress` | `Module::import` → `JS_LoadModule`，再同步泵并处理返回属性 | 可推进 jobs 和定时器，因此能等待部分 TLA；不保证任意异步 future 进展 |
+| dune | 无内建 Node CJS loader | 不支持 | 不适用 |
+| txiki | 无内建 Node CJS loader | 不支持 | 不适用 |
+
+Node/Deno 的 ESM 代码可用 `node:module` 的 `createRequire(import.meta.url)` 建立 require；普通 ESM 没有词法绑定的 Node require。LLRT 安装了全局 require，其 `createRequire` 当前只是返回该函数，不能假定相同 base 绑定语义。
+
+Node/Deno 的 CJS 环可以拿到当前 `module.exports`，但不代表属性已初始化，也不保证未来替换整个 `module.exports` 会更新旧引用。LLRT 的 progress 占位与 exports 存储分离，本轮部分导出实验存在差异，见 §10。
+
+### 9.5 双向互操作、解析条件与 live binding
+
+| 方向 | Node | Deno | LLRT |
+|---|---|---|---|
+| ESM import CJS | 静态分析导出名，创建 synthetic `ModuleWrap`；求值 callback 执行 CJS | 分析导出名，生成调用 createRequire 的 ESM 源码 wrapper | loader 先 require 执行 CJS，再枚举 keys 并生成 ESM 源码 wrapper |
+| CJS default | 通常引用整个 `module.exports` | wrapper `export default mod` | `export default value.default \|\| value` |
+| CJS 具名导出 | wrapper 求值时设置属性值，不自动跟随以后赋值 | wrapper 从 CJS 对象取值并导出 | 析构到 const 再导出；动态获取名字不等于 live binding |
+| require ESM 的绑定 | namespace/facade 通常保留对 ESM binding 的访问 | 同样通过 namespace/facade | 可拷贝导出属性或合并 default 对象；测试中 `let x` 的后续变化不可见 |
+
+static/dynamic import 使用 import 解析条件，require 使用 require 条件；带条件 exports 的包可以选择不同文件。因此“import 与 require 共享实例”应附带**同一解析目标、同一 realm/context、正确的跨缓存桥接**等前提。CJS 的 default 对象内部变化可见，也不意味着具名导出会随之自动变化。
+
+### 9.6 模块身份和缓存层次
+
+| Runtime | ESM 实例身份 | 额外缓存/状态 | 需要注意的边界 |
+|---|---|---|---|
+| dune | resolve 返回的 path | `seen`、`same_origin` | load 层补扩展名不合并 path；`./a` 与 `./a.js` 可执行两次 |
+| LLRT | QuickJS name + attributes | host `ModuleCache.esm[path]`；`RequireState`；包路径缓存 | host cache 和 magic prefixes 参与桥接；require 返回对象不等于 namespace |
+| txiki | normalizer 返回的 name + attributes | builtin 源码/字节码表 | 文本规范化不是完整 realpath/URL canonicalization |
+| Deno | `(ModuleName, RequestedModuleType)` → ID → handle | CLI graph、alias、装载 visited；CJS filename cache | ModuleId 是注册下标；CLI graph 和 CJS cache 均不是 V8 module 本身 |
+| Node | `(URL,type)` → job → ModuleWrap | resolve cache；CJS filename cache；builtin map | 两套 loader/cache 必须桥接；query/fragment、符号链接选项和 hooks 会影响身份 |
+
+### 9.7 builtin 交付与编译缓存
+
+| Runtime | builtin 交付 | 实例化/执行时机 |
 |---|---|---|
-| 编译 | `ScriptCompiler::CompileModule` | `JS_Eval(COMPILE_ONLY)` |
-| 字节码 | `ScriptCompiler::CreateCodeCache`（未在本文 runtime 中使用） | `JS_ReadObject` / `JS_WriteObject` |
-| 静态依赖 | `Module::GetModuleRequests` | `JSResolveModule` / `req_module_entries` |
-| 链接 | `Module::InstantiateModule` + resolve callback | `js_link_module`（`JS_EvalFunction` 内部） |
-| 求值 | `Module::Evaluate` → Promise | `js_evaluate_module`（`JS_EvalFunction` 内部） |
-| namespace | `Module::GetModuleNamespace` | `JS_GetModuleNamespace` |
-| dynamic import | host callback 返回 Promise | `js_dynamic_import` 内部建 Promise + job |
-| import.meta | host callback 填充 | `JS_GetImportMeta` + host 填充 |
-| native module | `Module::CreateSyntheticModule` | `JS_NewCModule` + `JS_AddModuleExport` |
-| 模块缓存 | 无 | `ctx->loaded_modules` |
-| 环检测 | 无（host 负责） | DFS + Tarjan SCC |
+| dune | `include_str!` 的 JS ESM 源码 | 环境入口同步加载 builtin 图；其他 builtin 按需加载 |
+| LLRT | native `ModuleDef` + 嵌入 `.lrt` bytecode | native 声明/求值；bytecode 解压/反序列化后进入 QuickJS 图 |
+| txiki | C module + esbuild/tjsc 生成的 C 字节数组 | core/polyfills 启动执行，stdlib 按需加载 |
+| Deno | extension ESM、lazy/synthetic ESM、snapshot | 启动或首次访问，取决于 extension 配置 |
+| Node | `BuiltinModule`、js2c/snapshot、ESM facade | CJS builtin 与 ESM facade 连接同一 exports 存储 |
 
-### 9.4 树形/去重策略
+V8 code cache 和 QuickJS bytecode 都属于**编译产物复用**，不是模块实例缓存的替代品。Deno `ModuleMap::new_es_module` 路径调用 `create_code_cache()`；Node `ModuleWrap::CreateCachedData` 调 `ScriptCompiler::CreateCodeCache`。是否启用、何时保存和失效策略需沿各自代码继续分析，不能写成“V8 runtime 未使用 code cache”。
 
-| Runtime | 树形 | 环处理 | 同一模块被多次 import |
-|---|---|---|---|
-| dune | 显式 `Rc` 树 + `seen` 表 | **不支持**，`fast_forward` 死锁 | `by_path` 命中直接复用；`Duplicate` 节点表示已见 |
-| LLRT | QuickJS DAG | QuickJS SCC | `js_find_loaded_module` 命中复用；native 模块由 QuickJS 保证只 load 一次 |
-| txiki | QuickJS DAG | QuickJS SCC | 同上 |
-| Deno | 索引表（id/handle/name）+ futures | `instantiate_module2` 交给 V8；V8 负责绑定 | `visited` + `get_id` + alias |
-| Node ESM | `ModuleJob` 图 + `ModuleWrap` | `syncLink` 先入缓存，再递归 link | `loadCache` 命中复用 job |
-| Node CJS | `Module` 对象 + `children` | 先入 `Module._cache`，再执行 | `Module._cache` 命中返回 exports |
+### 9.8 依赖库在 module 路径中的实际角色
 
-### 9.5 cycle / TLA / dynamic import 语义
-
-| Runtime | 静态环 | TLA | `import()` resolve 时机 |
-|---|---|---|---|
-| dune | 空转（10s 超时） | 不等待，namespace 可能先于 TLA 完成 | evaluate 后立即 resolve namespace |
-| LLRT | QuickJS 抛 TDZ ReferenceError | QuickJS 跟踪，等待完成 | 求值 promise 完成后 resolve |
-| txiki | QuickJS 抛 TDZ ReferenceError | QuickJS 跟踪，等待完成 | 求值 promise 完成后 resolve |
-| Deno | V8/JS 语义抛 TDZ ReferenceError | 显式跟踪 `pending_dyn_mod_evaluations` | 等待 evaluation 完成 |
-| Node | TDZ ReferenceError；`require(esm)` 环抛 `ERR_REQUIRE_CYCLE_MODULE` | `IsGraphAsync` + async evaluate | 等待 `ModuleJob.run()` |
-
-### 9.6 builtin 交付
-
-| 形态 | 代表 | 优点 | 代价 |
-|---|---|---|---|
-| JS 源码内嵌，运行时编译 | dune | 简单、可读 | 启动慢；依赖需要 ESM 图 |
-| native `ModuleDef` + global primordials | LLRT | 快；无需 ESM 解析 | 依赖隐式；需要初始化顺序 |
-| 预编译 bytecode | LLRT、txiki | 构建期编译；启动快 | 构建复杂；调试稍难 |
-| ESM source / snapshot / lazy facade | Deno（Extension）、Node（`BuiltinModule` + ESM facade） | 统一模块模型；支持懒加载/Node facade | 架构复杂；需要 snapshot/source 支持 |
-
-builtin 之间的依赖：
-
-| Runtime | 依赖形态 | 例子 |
+| Runtime | 依赖库 | 已核查的角色 |
 |---|---|---|
-| dune | 真实 ESM import | `main -> @web/fetch -> http -> net -> dns`；`test -> fs` |
-| LLRT | native 共享 crate/global + JS builtin import native | `fs -> llrt_buffer`/global `Buffer`；`stream -> node:events`、`node:util` |
-| txiki | core 构建期 bundle；stdlib 运行期 import internal | `tjs:path -> tjs:internal/path`；`tjs:hashing -> tjs:internal/core` |
-| Deno | extension ESM import；lazy/synthetic | `node:stream` 等 lazy polyfill；`node:url` 等 synthetic ESM |
-| Node | builtin map + internal require + ESM facade | CJS builtin 之间 `require`；ESM `node:fs` 通过 facade |
+| dune | crabuv / rayon | 用户模块源码获取投递到 worker，完成后回 JS 线程编译；builtin 同步路径另行处理 |
+| LLRT | Tokio / rquickjs Spawner | loader 读文件同步；普通运行驱动 jobs 和 futures；require 泵只驱动 jobs 与定时器 |
+| txiki | libuv / libwebsockets | loader 用同步 fs 和阻塞 HTTP；event loop 驱动外部事件和 QuickJS jobs |
+| Deno | futures / Tokio | core 用 FuturesUnordered 编排加载；CLI 的外部 I/O 仍依赖具体运行时；同步 require 有 block_on 装载路径 |
+| Node | libuv / loader worker | 默认主线程文件读取同步；可选异步 hooks 通过 worker 消息桥接 |
 
-### 9.7 CJS / npm
+同步 `uv_fs_*` 不提交异步请求，但阻塞调用线程；不能称为“不占用事件循环”。同样，使用 `FuturesUnordered` 不说明底层 I/O 是否用线程池，返回 Promise 也不说明加载 I/O 一定非阻塞。
 
-| Runtime | CJS | npm | 策略 |
-|---|---|---|---|
-| Node.js | 原生 | 原生 | CJS 优先，ESM 后加并桥接 |
-| Deno | Node compat | 原生 | ESM 优先，npm/Node 作为兼容层 |
-| LLRT | 部分 | Node resolver + bundling | Lambda 场景，CJS 为 AWS SDK 服务 |
-| dune | 无 | 无 | import map / URL / 预打包 |
-| txiki.js | 无 | 无 | Web/URL/import map，刻意不做 Node |
+### 9.9 环、错误与进程存活
 
-### 9.8 依赖库在 module 路径中的真实角色
-
-| Runtime | 依赖库 | module 路径中的角色 |
-|---|---|---|
-| dune | **crabuv**（rayon） | `handle.spawn` 把源码读取放到线程池；完成回调回到 loop 线程再编译/递归。module loading 与 fs/dns/net 共用 async 基础设施 |
-| LLRT | **tokio** + rquickjs Spawner | module loader 本身是同步 `std::fs`；tokio 只服务应用 API。事件循环 = QuickJS job queue + rquickjs future 队列 |
-| txiki | **libuv** | loader 用 `uv_fs_*`（`loop=NULL`，同步 syscall）；`TJS_Run` 用 `uv_run` 驱动循环，`uv_check` 排空 QuickJS job；没有把模块 I/O 放到线程池 |
-| Deno | **tokio**（CLI） | deno_core 的模块装载用 `FuturesUnordered`，不是 tokio task；求值用 `tokio::sync::oneshot` 桥接 V8 Promise；CLI 的 JS 跑在 current-thread tokio |
-| Node | **libuv** | 主线程 `readFileSync` → `uv_fs_*`（`cb=NULL`，同步 syscall，不进线程池）；只有 loader hook worker 的 MessagePort/Atomics 是真正异步/跨线程 |
-
-一个常见误解是“用了 libuv/tokio，所以 module loading 是异步的”。实际上：
-
-- txiki 和 Node 主线程都是**同步**加载；
-- LLRT 是**同步**加载；
-- dune 是**异步**加载（crabuv 线程池）；
-- Deno 的 deno_core 是 **futures 异步**，但 CLI 的 `prepare_load` 可能在 current-thread runtime 上同步等待。
-
-### 9.9 启动与懒加载
-
-| Runtime | 构建期 | 启动期 | 懒加载 |
-|---|---|---|---|
-| dune | 几乎不做 | 按 import 图解析 builtin，`main.js` 拉起大部分 | 未 import 的 builtin |
-| LLRT | 编译 JS builtin 为 bytecode | 注册 native module / 解压 bytecode | 首次 import |
-| txiki | esbuild + qjsc | core/polyfills eager | stdlib `tjs:*` |
-| Deno | snapshot + `deno_graph` + emit/code cache | extension entry point | `lazy_loaded_esm` |
-| Node | js2c + startup snapshot | builtin map / CJS bootstrap | CJS require / 动态 ESM |
-
-### 9.10 五套状态机放在一起
-
-```text
-dune (host-owned)
-  Fetching ──compile/insert──► Resolving ──deps ready──► Ready
-       │                          │  ▲
-       │                          │  └── deps not ready (self-loop)
-       └── load fail ──► exception  └── seen[path] ──► Duplicate ──seen Ready──► Ready
-  Ready ──► instantiate_module ──► evaluate (Promise dropped) ──► namespace (立即)
-
-QuickJS (engine-owned)
-  UNLINKED ──js_link_module──► LINKING ──DFS/SCC──► LINKED
-       ▲                         │
-       └──── link fail ──────────┘
-  LINKED ──js_evaluate_module──► EVALUATING ──sync──► EVALUATED
-                                     └──TLA──► EVALUATING_ASYNC ──deps settle──► EVALUATED
-
-Deno (core-owned)
-  prepare ──► pending_dynamic_imports (RecursiveModuleLoad)
-        ──► compile + create_module_info
-        ──► instantiate_module2
-        ──► module.evaluate()
-        ──► pending_dyn_mod_evaluations
-        ──► fulfilled ──► resolve(namespace)
-        └──► rejected  ──► reject(exception)
-
-Node ESM (JS-owned)
-  Uninstantiated ──syncLink/link──► Linked ──instantiate──► Instantiated
-        ──evaluateSync (无 TLA)──► Evaluated
-        └──evaluate() (有 TLA)──► Evaluating ──settle──► Evaluated
-
-Node CJS (sync)
-  new Module ──► Module._cache[filename] = module ──► compile wrapper
-        ──► execute ──► module.loaded = true
-```
-
-| 状态机 | 状态存在哪 | 谁推进 | 最终交付 |
-|---|---|---|---|
-| dune | `EsModule.status` + `ModuleMap.seen` | `EsModuleFuture` + `fast_forward_imports` | `get_module_namespace()`（不等 TLA） |
-| QuickJS（LLRT/txiki） | `JSModuleDef.status` | `js_link_module` / `js_evaluate_module` | engine evaluation Promise |
-| Deno | `ModuleInfo` + `TrackedFutures` + `pending_*` | `poll_progress` + `module_waker` | evaluation fulfilled 后 resolve |
-| Node ESM | `ModuleJob` 字段 + V8 `ModuleWrap` | `syncLink` / `instantiate` / `evaluate` | job.run() 后 `getNamespace()` |
-| Node CJS | `Module.loaded` + `Module._cache` | `Module._load` 同步执行 | `module.exports` |
-
-这张表是全文的“状态归属”总结：
-
-- **host-owned** 的状态机必须自己写“什么时候算 ready、什么时候算失败、TLA 要不要等”；
-- **engine-owned** 的状态机由 QuickJS 保证，host 只需要把 loader 写对；
-- **core-owned** 的状态机由 `deno_core` 的 futures 和 V8 共同推进；
-- **JS-owned** 的状态机最灵活，但 CJS/ESM 两套状态必须自己桥接。
+- **合法 ESM 环**由引擎 SCC 算法支持；只有过早读取未初始化绑定才会触发 TDZ。dune 用户路径另有 host Ready 死锁，不能归因于 V8。
+- **CJS 环**依靠先入缓存、暴露部分 exports；Node/Deno 和 LLRT 的占位细节不同。
+- **dynamic import 错误**应由用户 import Promise reject；加载失败、链接失败、求值失败要分别验证，不能只测找不到文件。
+- **TLA 语义**与**进程 liveness**分开：引擎负责异步求值依赖，host 负责 jobs、I/O 与退出策略。Deno 有 stalled TLA/deadlock 检测；txiki 的 pending Promise 本身不一定保活；LLRT 的 require 泵可能在无可推进任务时等待。
 
 ---
 
-## 10. 行为验证：编译并运行五个 runtime
+## 10. 行为验证：环境、脚本与结果
 
-### 10.1 实验设计
+### 10.1 本轮验证范围
 
-实验文件位于 `.modtest/exp/`（临时目录，不属于交付物）：
+使用 §0.2 的四个本地构建 binary 加安装版 Node：`deno/target/debug/deno`、`dune/target/debug/dune`、`llrt/target/debug/llrt`、`txiki.js/build/tjs`、`PATH` 中的 Node。没有为此重新 build Node。
 
-| 文件 | 目的 |
+脚本在临时目录中创建独立 fixture，每次测试启动独立进程，记录 binary 路径、版本、stdout/stderr、退出码或超时。先对临时目录做 realpath，避免 macOS `/var` 与 `/private/var` 等别名干扰基本实例去重测试；路径身份的边界另用 alias 用例验证。共运行 27 个 runtime/fixture 组合。
+
+| Fixture | 要验证的行为 |
 |---|---|
-| `main1.js` + `a.js` | 静态 import 两次 + 动态 import 一次，检查 namespace 身份与去重 |
-| `main2.js` + `slow.js` | 模块内 TLA（`await setTimeout(300)`），检查 `import()` 是否等待 |
-| `main3.js` + `cyc1.js`/`cyc2.js` | 静态环，检查 TDZ/死锁 |
-| `main4.js` | `import.meta.url` / `import.meta.main` |
-| `bridge.mjs` / `cjs.cjs` | Node/LLRT 的 CJS ↔ ESM 桥接 |
-| `reqesm.cjs` / `reqtla.cjs` | `require(esm)`、`require(TLA esm)` |
-| `internal.js` / `stdlib.js` | txiki 的 `tjs:internal/*` 限制、`tjs:path` |
-| `deno_ext.js` | Deno 的 `ext:` 限制、`node:fs` facade |
+| `identity.mjs` | 两次 static import + 一次 dynamic import 是否复用 namespace；实际求值次数 |
+| `cycle-main.mjs` | 使用函数声明构造不触发 TDZ 的合法静态环；不将“所有环”误判为错误 |
+| `dynamic.mjs` | 两个并发 import 的 namespace 身份，以及 resolve 时定时器 TLA 是否已经完成 |
+| `fail-main.mjs` | 被导入模块的同步 throw 是否通过 import Promise reject |
+| `require.cjs` | require ESM 的 binding 是否继续更新；require 含定时器 TLA 的 ESM |
+| `partial-main.cjs` | CJS 环中能否读取另一模块在进入环之前写入的 exports |
+| `alias.mjs` | dune 中 `./counter` 与 `./counter.js` 是否具有相同实例身份 |
 
-核心代码：
+### 10.2 可直接复现的脚本
 
-```js
-// a.js
-globalThis.__log ??= [];
-globalThis.__log.push("eval:a");
-export const v = 1;
-export default { v };
+将以下代码保存为 Python 文件后执行 `python3 <文件名>`。默认仓库位于 `~/github`；如使用其他位置，只需修改 `repos`。结果 JSON 与全部 fixtures 保留在脚本打印的临时目录中。3 秒超时用于截断本轮已知的 dune 环死锁；不同机器上若出现新超时，应结合源码和更长时间复核，不能仅凭超时推断语义。
 
-// main1.js
-globalThis.__log = [];
-import * as a1 from "./a.js";
-import * as a2 from "./a.js";
-const a3 = await import("./a.js");
-console.log("A same-namespace:", a1 === a2, a1 === a3, a1.v, a3.default.v);
+```python
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import json
+import re
+import shutil
+import subprocess
+import tempfile
+
+repos = Path.home() / 'github'
+root = Path(tempfile.mkdtemp(prefix='js-module-review-')).resolve()
+files = {
+    'once.mjs': 'globalThis.evals=(globalThis.evals||0)+1; export const n=globalThis.evals;',
+    'identity.mjs': 'import * as a from "./once.mjs"; import * as b from "./once.mjs"; const c=await import("./once.mjs"); console.log("identity",a===b,a===c,globalThis.evals);',
+    'cycle-main.mjs': 'import "./cycle-a.mjs";',
+    'cycle-a.mjs': 'import { b } from "./cycle-b.mjs"; export function a(){return "a"}; console.log("cycle",b());',
+    'cycle-b.mjs': 'import { a } from "./cycle-a.mjs"; export function b(){return a()+"b"};',
+    'slow.mjs': 'await new Promise(r=>setTimeout(r,30)); globalThis.done=true; export const value=42;',
+    'dynamic.mjs': 'const [a,b]=await Promise.all([import("./slow.mjs"),import("./slow.mjs")]); console.log("dynamic",a===b,globalThis.done===true);',
+    'fail.mjs': 'throw new Error("module-boom"); export const x=1;',
+    'fail-main.mjs': 'try {await import("./fail.mjs"); console.log("unexpected-fulfilled")} catch(e){console.log("caught",e.message)}',
+    'live.mjs': 'export let x=1; export function inc(){x++}',
+    'require.cjs': 'const m=require("./live.mjs"); m.inc(); console.log("require-live",m.x); try{const t=require("./slow.mjs"); console.log("require-tla",t.value)}catch(e){console.log("require-tla-error",e.code||e.message)}',
+    'partial-a.cjs': 'exports.a="a"; const b=require("./partial-b.cjs"); exports.seen=b.seen;',
+    'partial-b.cjs': 'exports.seen=require("./partial-a.cjs").a;',
+    'partial-main.cjs': 'console.log("partial",require("./partial-a.cjs").seen);',
+    'counter.js': 'globalThis.count=(globalThis.count||0)+1; export const n=globalThis.count;',
+    'alias.mjs': 'import * as a from "./counter"; import * as b from "./counter.js"; console.log("alias",a===b,globalThis.count);',
+}
+for name, source in files.items():
+    (root / name).write_text(source)
+node = shutil.which('node')
+if not node:
+    raise SystemExit('node is required for the installed-version comparison')
+runtimes = {
+    'Node': [node],
+    'Deno': [str(repos / 'deno/target/debug/deno'), 'run', '--no-config', '--allow-read'],
+    'dune': [str(repos / 'dune/target/debug/dune'), 'run'],
+    'LLRT': [str(repos / 'llrt/target/debug/llrt')],
+    'txiki': [str(repos / 'txiki.js/build/tjs'), 'run'],
+}
+versions = {}
+for name, command in runtimes.items():
+    result = subprocess.run([command[0], '--version'], capture_output=True, text=True, check=True, timeout=10)
+    versions[name] = {'binary': command[0], 'version': result.stdout.strip()}
+ansi = re.compile(r'\x1b\[[0-9;]*m')
+def run(job):
+    name, filename = job
+    try:
+        result = subprocess.run(runtimes[name] + [str(root / filename)], cwd=root,
+                                capture_output=True, text=True, timeout=3)
+        return {'runtime': name, 'test': filename, 'exit': result.returncode,
+                'stdout': ansi.sub('', result.stdout).strip(),
+                'stderr': ansi.sub('', result.stderr).strip()}
+    except subprocess.TimeoutExpired:
+        return {'runtime': name, 'test': filename, 'timeout_seconds': 3}
+jobs = [(name, filename) for name in runtimes
+        for filename in ['identity.mjs', 'cycle-main.mjs', 'dynamic.mjs', 'fail-main.mjs']]
+jobs += [(name, filename) for name in ['Node', 'Deno', 'LLRT']
+         for filename in ['require.cjs', 'partial-main.cjs']]
+jobs += [('dune', 'alias.mjs')]
+with ThreadPoolExecutor(max_workers=4) as pool:
+    results = list(pool.map(run, jobs))
+report = {'versions': versions, 'results': results}
+(root / 'results.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
+print('Results:', root / 'results.json')
+print(json.dumps(report, ensure_ascii=False, indent=2))
 ```
 
-```js
-// slow.js
-globalThis.__log ??= [];
-globalThis.__log.push("eval:slow:start");
-await new Promise((r) => setTimeout(r, 300));
-globalThis.__log.push("eval:slow:end");
-export default "slow-done";
+`identity` 的计数在依赖模块内部递增，入口不会在 static import 已执行后把计数清零。`dynamic` 则在 import 完成后直接检查 TLA 后设置的标记，避免只有读取未初始化导出时才发现提前完成。
 
-// main2.js
-globalThis.__log = [];
-const p1 = import("./slow.js");
-const p2 = import("./slow.js");
-const [m1, m2] = await Promise.all([p1, p2]);
-console.log("B tla:", m1.default, m1 === m2, globalThis.__log.join(","));
-```
+### 10.3 实测结果
 
-### 10.2 结果矩阵
-
-| 实验 | dune 0.11.4 | LLRT 0.9.0-beta | txiki v26.6.0 | Deno 2.9.7 | Node 26.12.1 |
+| 检查项 | Node 24.14.0（安装版） | Deno 2.9.8（本地 debug） | dune 0.11.4（本地 debug） | LLRT 0.9.0-beta（本地 debug） | txiki 26.6.0（本地 make） |
 |---|---|---|---|---|---|
-| **命名空间身份**（静态两次 + 动态一次） | `true true 1 1` | `true true 1 1` | `true true 1 1` | `true true 1 1` | `true true 1 1` |
-| **TLA + 并发 import** | `ReferenceError: Cannot access 'default' before initialization` | `slow-done true eval:slow:start,eval:slow:end` | 同 LLRT | 同 LLRT | 同 LLRT |
-| **静态环** | `timeout`（空转） | `ReferenceError c1v is not initialized` | 同 LLRT | `ReferenceError Cannot access 'c1v' before initialization` | 同 Deno |
-| **`import.meta.main`** | `false` | `undefined`（无此字段） | `true` | `true` | `true` |
-| **`import.meta.url`** | 绝对路径 | `file://` URL | `file://` URL | `file://` URL | `file://` URL |
-| **CJS/ESM 桥接** | 不支持 CJS | `c === m.default`，CJS 只 eval 一次 | 无 CJS | Node compat | `c === m.default`，CJS 只 eval 一次 |
-| **`require(esm)`** | 无 | 可用，ESM 只 eval 一次 | 无 | Node compat | 可用；TLA 抛 `ERR_REQUIRE_ASYNC_MODULE` |
-| **builtin 限制** | 无 | native 模块 | `tjs:internal/core` 被拒绝 | `ext:core/mod.js` 被拒绝 | `node:` 正常 |
+| namespace / 求值次数 | `identity true true 1` | 同 Node | 同 Node | 同 Node | 同 Node |
+| 合法静态环 | `cycle ab` | 同 Node | 3 秒超时 | 同 Node | 同 Node |
+| 并发 import 等待 TLA | `dynamic true true` | 同 Node | `dynamic true false` | 同 Node | 同 Node |
+| import 求值失败 | `caught module-boom`，exit 0 | 同 Node | `unexpected-fulfilled`，随后未处理 rejection，exit 1 | 同 Node | 同 Node |
+| require ESM，调用 inc 后读 x | `require-live 2` | 同 Node | 无内建 require，未执行此 fixture | `require-live 1` | 无内建 require，未执行此 fixture |
+| require 定时器 TLA | `ERR_REQUIRE_ASYNC_MODULE` | 同 Node | 不适用 | `require-tla 42` | 不适用 |
+| CJS 环中的部分导出 | `partial a` | 同 Node | 不适用 | `partial undefined` | 不适用 |
+| dune 省略扩展名的身份 | 未运行 | 未运行 | `alias false 2` | 未运行 | 未运行 |
 
-### 10.3 逐项观察
+### 10.4 实测与源码如何对应
 
-**(1) 命名空间身份**
+1. **dune 环死锁**：`EsModule::fast_forward` 互相等待 Ready，尚未进入 V8 链接；正常的 Node/Deno/LLRT/txiki 环证明 TDZ 不是环必然产生的结果。
+2. **dune dynamic import 提前成功/错误丢失**：`fast_forward_imports` 丢弃 evaluation Promise 后 resolve namespace，与 TLA 标记为 false、throw 未被 catch 的结果一致。
+3. **dune 同文件重复实例**：`FsModuleLoader::resolve` 保留省略扩展名的 path，`load_as_file` 在读文件时才尝试扩展名；`ModuleMap` key 因此不同。
+4. **LLRT require ESM 拷贝导出**：`require.rs` 遍历 imported object 属性写入返回对象；引擎中的 `x` 已更新，但拷贝出的数值未更新。
+5. **LLRT require 等待 TLA**：同步循环推进 `poll_timers` 和 QuickJS jobs，使定时器 TLA 完成；这不是对任意 Tokio/rquickjs future 进展的保证。
+6. **LLRT CJS 部分导出差异**：`state.progress` 的对象先供环返回，而 `state.exports` 的属性在 require 完成阶段才合并；Node/Deno 直接从缓存 Module 读取当前 exports。
+7. **Node/Deno require TLA 拒绝**：对应 ESM bridge 中 `hasAsyncGraph` / `is_graph_async()` 检查，不能因为模块“最终能完成”就当作同步图。
 
-五个 runtime 都返回 `true true`：
-
-- 静态 import 同一 URL 两次，得到同一个 namespace；
-- 动态 `import()` 与静态 import 也共享同一个 namespace。
-
-这说明它们的 module cache 在“同一 canonical name”上是一致的，即使内部结构完全不同：
-
-- dune 靠 `by_path`；
-- QuickJS 靠 `ctx->loaded_modules` 的 name + attributes；
-- Deno 靠 `get_id` + `by_name`；
-- Node 靠 `loadCache[url][type]`。
-
-**(2) TLA**
-
-只有 dune 失败：
-
-```text
-Uncaught (in promise) ReferenceError: Cannot access 'default' before initialization
-```
-
-原因是 dune 在 `module.evaluate()` 后立刻用 `get_module_namespace()` resolve dynamic import Promise，不等待 evaluation Promise。其它四个 runtime 都等到了 `slow-done`，且日志显示 `eval:slow:start,eval:slow:end` 在 `await` 返回前完成。
-
-**(3) 静态环**
-
-- dune：`fast_forward` 的两个 `Resolving` 节点互相等待，`pending` 永远非空，进程空转；`timeout 10` 返回 124。
-- LLRT/txiki：QuickJS 的链接/求值按 SCC 处理，访问未初始化的 `c1v` 抛 TDZ `ReferenceError`。
-- Deno/Node：V8 的 ESM 语义抛 TDZ `ReferenceError`。
-
-注意：三种错误文案不同，但都符合 ECMAScript 的 TDZ 语义；dune 是唯一没有正确进入求值阶段的。
-
-**(4) `import.meta`**
-
-| Runtime | `url` | `main` |
-|---|---|---|
-| dune | 绝对路径（不是 `file://`） | false |
-| LLRT | `file://` | 不存在（`undefined`） |
-| txiki | `file://` | true |
-| Deno | `file://` | true |
-| Node | `file://` | true |
-
-dune 的 `url` 也不符合 ESM 规范（应为 `file://` URL），这是 host 自己实现 `import.meta` 的代价。
-
-**(5) Node CJS/ESM 桥接**
-
-```text
-node bridge.mjs
-# node cjs bridge: true 2 undefined 1
-
-node reqesm.cjs
-# node require(esm): 1 1 1
-
-node reqtla.cjs
-# require TLA: ERR_REQUIRE_ASYNC_MODULE require() cannot be used on an ESM graph
-# with top-level await. Use import() instead. ...
-```
-
-- `c === m.default` 为 true：`import` CJS 得到 synthetic namespace，`default` 指向 `module.exports`；
-- `m.x` 为 `undefined`：CJS 的 `x` 不是静态可分析的 named export，只有 `default`；
-- CJS 只 eval 一次（`__cjsEval === 1`）；
-- `require(esm)` 可以工作，且 ESM 只 eval 一次；
-- `require(TLA esm)` 抛 `ERR_REQUIRE_ASYNC_MODULE`。
-
-**(6) LLRT CJS**
-
-```text
-llrt llrt_bridge.js
-# llrt cjs eval count: 1
-# llrt cjs bridge: true 2 2 1
-
-llrt cjsesm.cjs
-# llrt require(esm) count: 1 1 1
-```
-
-LLRT 的 `import` CJS 与 `require` CJS 共享同一个实例；与 Node 不同，`m.x` 有值（LLRT 会从 `exports` 对象拷贝具名属性）。
-
-**(7) txiki 的 builtin 与 import map**
-
-```text
-tjs run internal.js
-# internal blocked: ReferenceError module 'tjs:internal/core' is not exposed to user code
-
-tjs run stdlib.js
-# tjs:path a/b function
-# meta file:///abs/stdlib.js true /abs
-
-tjs run --import-map importmap.json map.js
-# mapped ok 1 file:///abs/map.js
-```
-
-- `tjs:internal/*` 的闸门在 normalizer，用户模块名不以 `tjs:` 开头，直接被拒绝；
-- `tjs:path` 是 lazy bytecode builtin；
-- import map 由 JS 闭包实现，C 侧 normalizer 只调用它。
-
-**(8) Deno 的 `ext:` 与 `node:`**
-
-```text
-deno run --quiet deno_ext.js
-# ext blocked: TypeError Importing ext: modules is only allowed from ext: and node: modules.
-# Tried to import ext:core/mod.js from file:///.../deno_ext.js
-# node:fs facade: function false
-```
-
-- `ext:` 只允许内部模块 import；
-- `import("node:fs")` 拿到的是 ESM facade，`fs.default !== fs`，说明它不是一个普通 CJS namespace。
-
-**(9) `deno info --json`**
-
-```bash
-deno info --json main1.js
-```
-
-输出包含 `roots`、`modules[]`、每个 module 的 `dependencies[]`（`specifier`、`code.specifier`、`resolutionMode`、`span`）、`redirects`。这直接展示了 `deno_graph` 的节点/边结构，而不是运行时 `ModuleMap`。
-
-### 10.4 实验结论与注意事项
-
-- **行为差异最大的地方不是 resolve/load，而是 link/evaluate 的所有权**：dune 因为自己实现状态机，在环和 TLA 上偏离规范；其它四个 runtime 把这一层交给 V8/QuickJS。
-- **QuickJS 与 V8 都能正确处理环和 TLA**，差异主要在 loader/host 的缓存与 builtin 交付。
-- **`import.meta` 是 host 责任**：dune 的 `url` 不是 `file://`，`main` 为 false；LLRT 没有 `main`。
-- 运行版本与源码 HEAD 可能不同（尤其 Deno/Node 安装版），上表只用于语义对照，不作为版本兼容性承诺。
+这些是有针对性的行为验证，不是完整兼容性测试。没有用它们证明所有别名、attributes、hooks、网络加载、跨 realm 情况都正确；Node 当前 HEAD 的内部 job 调度仍以源码为依据。原稿中 import.meta、builtin 隔离、import map 等额外输出未在这套脚本中重跑，相关实现说明保留为源码分析。
 
 ---
 
 ## 11. 对 rsvim 的映射
 
-rsvim 当前是 **V8 + host-owned module graph**，但比 dune 更简化：只有静态 module map，没有 dune 的 `EsModule`/`ModuleGraph`/`pending` 状态机。
+原稿附带了 rsvim 的设计讨论。本轮 `~/github/rsvim` 路径不存在，未复核其当前源码；以下保留原稿的结构摘录和适用于类似 V8 embedder 的迁移建议，不作为 rsvim 当前实现状态的证据。
 
-### 11.1 当前数据结构
+### 11.1 原稿结构与可复用模式
 
-`rsvim_core/src/js/module/module_map.rs`：
+原稿记录的 `rsvim_core/src/js/module/module_map.rs` 结构：
 
 ```rust
 pub struct ModuleMap {
@@ -2943,106 +2977,53 @@ pub struct ModuleMap {
 }
 ```
 
-与 dune 的差异：
+若加载器按“compile 当前模块 → 放入 map → 遍历静态请求 → 只加载尚未登记的依赖”执行，加载环可以通过已登记实例闭合。此后把同一 V8 module 返回给 `InstantiateModule` 的 resolve callback，循环链接和求值由 V8 负责。这是正常的分工，不是偶然绕过了环问题。
 
-| 字段/能力 | dune | rsvim 当前 |
-|---|---|---|
-| `by_path` | `HashMap<String, Global<Module>>` | `FoldMap`（插入顺序，便于测试/调试） |
-| `by_id` | `HashMap<i32, Vec<(path, module)>>` | 同构 |
-| `main` | 有 | 有 |
-| `seen: HashMap<path, ModuleStatus>` | 有 | **无** |
-| `pending: Vec<Rc<RefCell<ModuleGraph>>>` | 有 | **无** |
-| `EsModule` 依赖树 | 有 | **无** |
-| 动态 import 回调 | 有 | **注释掉**（`js.rs:106-107`） |
-| `fetch_module_tree` | 有 | 有，但只做静态递归 |
-| `fetch_module` | 无（dune 用 tree） | 有，用于无依赖的 builtin |
+`by_path` 管理身份；`by_id` 辅助从 referrer handle 反查名字。identity hash 不是唯一 ID，碰撞时仍需比较 handle。失败传播、路径规范化、缓存中失败实例的处理，与图是否使用自增 ID 是不同问题。
 
-`fetch_module_tree()` 的流程：
+### 11.2 dynamic import 的最小扩展
 
-```text
-fetch_module(filename, source)
-  -> compile_module
-  -> get_identity_hash
-  -> ModuleMap.insert(filename, id, Global(module))
-  -> for each request:
-       resolve_import(base=parent(filename), specifier)
-       if !module_map.contains(specifier):
-           fetch_module_tree(specifier, None)
-```
+不必先复制 dune 的 `EsModule` 树和 Ready 收敛规则。一个可行的扩展顺序是：
 
-它没有 `seen`/`pending`，依赖去重只看 `by_path.contains_key()`；因此：
+1. 定义规范化模块身份和加载中/已编译/失败的登记规则，避免并发创建重复实例。
+2. 将“源码已获取、静态依赖已登记”作为装载完成条件；不要要求环中的依赖先达到求值完成。
+3. 调用 V8 `InstantiateModule`，以异常返回替代无法恢复的查表 `unwrap`。
+4. 保存 `Evaluate` 返回的 Promise；fulfilled 时以 namespace 完成 import，rejected 时转发异常。
+5. 在 event loop 中推进 microtasks、I/O 与待完成模块任务，并明确定义无法继续推进的 TLA 如何报告。
 
-- 菱形依赖可以工作（第二次遇到已存在 path 就跳过）；
-- 环依赖会怎样？`fetch_module_tree` 在**编译当前模块后、递归依赖前**就调用了 `insert`，所以环的第二次 resolve 会看到 `by_path` 已有该 path，直接跳过，不会无限递归。链接阶段 V8 的 `instantiate_module` 会用 `module_resolve_cb` 找到已存在的 module，因此 rsvim 的静态环可能比 dune 更“幸运”；
-- 但没有状态/错误传播：如果子模块编译失败，`fetch_module_tree` 返回 `None`，父模块的依赖边没有对应 module，后续 `instantiate_module` 会在 `module_resolve_cb` 里 `unwrap` panic。
+无静态依赖的 builtin bundle 可单独编译并实例化；拆成互相 import 的 builtin 后，就要让 loader 能发现和登记完整依赖图。builtin 是源文件、native module、bytecode 还是 snapshot，不改变上述身份和 Promise 合约。
 
-`module_resolve_cb` 的关键行为（`rsvim_core/src/js/hook.rs`）：
+### 11.3 需要 CJS 时的新增责任
 
-```rust
-let referrer_id = referrer.get_identity_hash().get();
-let referrer = v8::Global::new(scope, referrer);
-let dependant = state.module_map.get_path(referrer_id, referrer).unwrap();
-let dependant = paths::maybe_parent(&dependant);
-let specifier = resolve_import(&dependant, &specifier, import_map).unwrap();
-let module = state.module_map.get(&specifier).unwrap();
-Some(v8::Local::new(scope, module))
-```
-
-两个 `unwrap` 是硬约束：
-
-- referrer 必须已在 `ModuleMap`；
-- 目标 specifier 必须已加载。
-
-因此 `fetch_module_tree` 必须在 `instantiate_module` 之前把整棵树（包括 builtin）全部放进 map。
-
-### 11.2 builtin 初始化
-
-`js.rs::init_builtin_modules()` 用 `fetch_module()` 编译两个无依赖的 bundle：
-
-```rust
-static BUILTIN_MODULES: [(&str, &str); 2] = [
-    ("00__web.js", include_str!("js/00__web.min.js")),
-    ("01__rsvim.js", include_str!("js/01__rsvim.min.js")),
-];
-```
-
-然后 `instantiate_module` + `evaluate`。因为这两个 bundle 没有静态 import，`fetch_module` 就足够；如果以后把 builtin 拆成互相 import 的模块，必须改用 `fetch_module_tree`，否则 `module_resolve_cb` 找不到依赖。
-
-### 11.3 与五者的关系
-
-```text
-rsvim 当前 ≈ dune 的静态子集
-  - 有 ModuleMap / by_path / by_id
-  - 有 module_resolve_cb / import.meta
-  - 无 EsModule/ModuleGraph/seen/pending
-  - 无动态 import
-  - builtin 是无依赖 bundle
-```
-
-如果要把 rsvim 往“完整 host-owned 图”推进，可以参考三条路线：
-
-1. **dune 路线**：补 `EsModule`/`ModuleGraph`/`ModuleStatus`/`fast_forward`，但必须同时修掉 dune 的环死锁和 TLA 丢弃问题（例如用 SCC 或直接委托 V8 的 `InstantiateModule` 状态机）；
-2. **Deno 路线**：把图放进 core 层，用 `ModuleId` + handle 数组 + `by_name` 索引，装载用 futures，求值用 V8 Promise + waker；
-3. **Node 路线**：把 ESM 状态机放进 JS，C++ 只做 `ModuleWrap` trampoline；适合需要大量 JS 层策略（hooks、CJS bridge）的场景。
-
-对于 rsvim 当前“编辑器内嵌 JS、builtin 为主、用户脚本为辅”的定位，最小可行演进是：
-
-```text
-短期:
-  - 保持静态图
-  - 给 fetch_module_tree 增加 seen/status + 失败传播
-  - 把 module_resolve_cb 的 unwrap 改成可报告错误
-中期:
-  - 补 EsModule/ModuleGraph + 动态 import（参考 dune，但修环/TLA）
-长期:
-  - 若需要 npm/CJS，参考 Deno/Node 的分层，而不是在 host 里手写完整状态机
-```
+Node/Deno 提供独立 CJS wrapper、filename cache、部分 exports 和双向 ESM 桥接；LLRT 展示了在 ESM 引擎之上模拟 CJS 的另一种实现，也暴露了返回值拷贝、部分 exports 和同步等待的兼容差异。需要 Node 生态时，应明确选择兼容目标，不能把 `require()` 简化成“阻塞等待 import Promise”。
 
 ---
 
 ## 12. 证据索引
 
 > 行号会随上游提交漂移；优先按函数/结构名搜索。
+
+### 本轮修正与三种 API 的关键证据
+
+| 结论 | 源文件 | 搜索入口 |
+|---|---|---|
+| V8 自己处理 ESM SCC 和异步依赖 | [source-text-module.cc](node/deps/v8/src/objects/source-text-module.cc) | `MaybeTransitionComponent`、`InnerModuleEvaluation` |
+| V8 Evaluated 可能仍有 pending TLA | [api.cc](node/deps/v8/src/api/api.cc) | `Module::GetStatus` |
+| 实例化失败回滚、求值 Promise 复用 | [module.cc](node/deps/v8/src/objects/module.cc) | `Module::Instantiate`、`ResetGraph`、`Module::Evaluate` |
+| Node 静态请求不走 dynamic callback | [module_job.js](node/lib/internal/modules/esm/module_job.js) | `syncLink`、`getModuleRequests` |
+| Node dynamic import 等待 job | [loader.js](node/lib/internal/modules/esm/loader.js) | `async import`、`importSyncForRequire` |
+| QuickJS compile-only 仍解析依赖、递归前标记 | [quickjs.c](txiki.js/deps/quickjs/quickjs.c) | `JS_EvalInternal`、`js_resolve_module` |
+| QuickJS JS import job 与 C API 的区别 | [quickjs.c](txiki.js/deps/quickjs/quickjs.c) | `js_dynamic_import_job`、`JS_LoadModule`、`JS_LoadModuleInternal` |
+| dune 提前完成 import / 丢失求值 rejection | [runtime.rs](dune/src/runtime.rs) | `fast_forward_imports` 中 `evaluate`、`resolve` |
+| dune 路径身份与扩展名补全分离 | [loaders.rs](dune/src/loaders.rs) | `FsModuleLoader::resolve`、`load_as_file` |
+| LLRT require 泵、返回属性拷贝、部分 exports | [require.rs](llrt/llrt_modules/src/module/require.rs) | `require`、`progress`、`poll_timers`、`imported_object.props` |
+| LLRT 提前执行 CJS 和额外 ESM cache | [loader.rs](llrt/llrt_modules/src/package/loader.rs) | `load_cjs_module`、`cache.esm` |
+| Deno 独立 CJS loader 与 wrapper | [01_require.js](deno/ext/node/polyfills/01_require.js) | `Module._load`、`wrapSafe`、`loadESMFromCJS` |
+| Deno require 的权限检查 | [require.rs](deno/ext/node/ops/require.rs) | `op_require_read_file`、`ensure_read_permission` |
+| Deno require ESM 拒绝 TLA 和跨模式环 | [ops_builtin.rs](deno/libs/core/ops_builtin.rs) | `op_import_sync`、`import_sync_eval_stack`、`is_graph_async` |
+| Deno import CJS 的源码 wrapper | [analyze.rs](deno/libs/node_resolver/analyze.rs) | `exports_to_wrapper_module` |
+| Deno 编译缓存 | [map.rs](deno/libs/core/modules/map.rs) | `create_code_cache` |
+| Node 编译缓存 | [module_wrap.cc](node/src/module_wrap.cc) | `ModuleWrap::CreateCachedData` |
 
 ### dune
 
@@ -3076,6 +3057,8 @@ rsvim 当前 ≈ dune 的静态子集
 | `ModuleLoader` | `llrt_modules/src/module/loader.rs:20-77` |
 | `RequireState` / `ModuleCache` | `llrt_modules/src/module/mod.rs:47-84` |
 | CJS require | `llrt_modules/src/module/require.rs:18-188` |
+| CJS 导出发现 / host ESM cache | `llrt_modules/src/package/loader.rs::load_cjs_module` / `load_module` |
+| createRequire 的 base 语义 | `llrt_modules/src/module/mod.rs::create_require` |
 | `ModuleBuilder` | `llrt_modules/src/module_builder.rs:38-42, 206-228` |
 | `EmbeddedResolver` | `llrt_core/src/modules/embedded/resolver.rs:38-53` |
 | `EmbeddedLoader` | `llrt_core/src/modules/embedded/loader.rs:93-159` |
@@ -3132,6 +3115,11 @@ rsvim 当前 ≈ dune 的静态子集
 | CLI `deno_graph` | `~/.cargo/registry/.../deno_graph-0.111.1/src/graph.rs:2193-2213` |
 | `CliModuleLoader` | `cli/module_loader.rs:600-618, 1322-1324` |
 | `MainModuleGraphContainer` | `cli/graph_container.rs:40-49` |
+| CJS loader / cache / wrapper | `ext/node/polyfills/01_require.js::Module._load` / `wrapSafe` |
+| CJS → ESM bridge | `ext/node/polyfills/01_require.js::loadESMFromCJS`；`libs/core/ops_builtin.rs::op_import_sync` |
+| ESM → CJS wrapper | `libs/node_resolver/analyze.rs::exports_to_wrapper_module` |
+| require 读取权限 | `ext/node/ops/require.rs::op_require_read_file` |
+| stalled TLA / deadlock | `libs/core/runtime/jsruntime.rs`，搜索 `find_and_report_stalled_level_await_in_any_realm` |
 
 ### Node.js
 
@@ -3163,6 +3151,8 @@ rsvim 当前 ≈ dune 的静态子集
 
 ### QuickJS / rquickjs 通用
 
+下表 `quickjs.c/h` 行号以 txiki 的 `deps/quickjs` 提交 `10b9969` 为准。LLRT 的对应实现位于 Cargo registry 的 `rquickjs-sys-0.14.0/quickjs`，函数名相同但行号略有差别；Rust binding 位于 `rquickjs-core-0.14.0/src`。不要把两份依赖的源码行号混用。
+
 | 内容 | 位置 |
 |---|---|
 | `JS_SetModuleLoaderFunc2` | `quickjs.h:1217-1224`；`quickjs.c:30562-30574` |
@@ -3173,43 +3163,22 @@ rsvim 当前 ≈ dune 的静态子集
 | `js_link_module` | `quickjs.c:31697-31725` |
 | `js_evaluate_module` | `quickjs.c:32384-32430` |
 | `js_dynamic_import` | `quickjs.c:31935-32029` |
+| compile-only 前先 resolve | `quickjs.c:38239-38247`，`JS_EvalInternal` |
+| C API 直接启动加载 | `quickjs.c::JS_LoadModule` / `JS_LoadModuleInternal` |
 | rquickjs `Loader` / `Resolver` | `rquickjs-core/src/loader.rs:44-146` |
 | rquickjs tuple fallthrough | `rquickjs-core/src/loader.rs:242-311` |
+| rquickjs declare / import | `rquickjs-core/src/value/module.rs::Module::declare` / `Module::import` |
 
 ---
 
 ## 13. 结论
 
-把这五个 runtime 放在一条光谱上：
+五种实现共享两类职责：**引擎执行 ESM 的链接与求值语义；runtime 决定模块身份、获取方式、API 桥接和事件循环推进**。QuickJS 内建名字注册表和递归装载驱动，V8 将这些加载组织工作交给 host；两者都处理 ESM 的循环依赖和 TLA。
 
-```text
-host/embedder-owned        engine/core-owned                    JS-owned
+- **dune**：Rust 中显式维护加载树。用户路径的 Ready 算法卡住合法环，dynamic import 没有正确等待和传播 evaluation Promise；这些是 host 装载/桥接缺陷，不能推导为 V8 缺少相关语义。
+- **LLRT**：QuickJS 管理静态 ESM 图，host 提供 resolver/loader、path cache 和 `RequireState`。require 借助 ESM 加载加同步泵实现，TLA、返回对象和循环部分导出与 Node/Deno 有可观察差异。
+- **txiki.js**：C normalizer/loader 提供文件、HTTP、import map 和 builtin；QuickJS 管理 ESM 实例与求值，libuv 驱动 jobs 和外部事件。源码 I/O 阻塞，没有内建 Node CJS loader。
+- **Deno**：CLI graph 管理源码准备，core ModuleMap 管理 ESM 身份和装载任务，V8 管理语义图；Node compat 再提供独立 CJS loader/cache，并通过 `op_import_sync` 和生成的 ESM wrapper 双向桥接。
+- **Node.js**：JS `ModuleLoader`/`ModuleJob` 管理装载与求值编排，C++ `ModuleWrap` 连接 V8；CJS 有独立同步 loader。当前源码主线程普通 ESM 路径主要使用 `ModuleJobSync`，仍不改变 `import()` 的 Promise 合约。
 
-dune                       Deno (deno_core)                     Node
-                           LLRT / txiki (QuickJS)
-```
-
-- **dune**：V8 的“手工 module graph”参考实现。`ModuleMap` + `EsModule` + `ModuleGraph` + `fast_forward` 展示了 host 拥有状态机的最大控制力，也展示了最大语义负担：环死锁、TLA 丢弃、`import.meta` 不规范。
-- **LLRT**：QuickJS engine 拥有图，host 提供 native `ModuleDef` + phf 字节码 + Node resolver 的兼容层；CJS 通过 `__cjs:`/`__cjsm:` 两个前缀和 `RequireState` 嫁接。
-- **txiki.js**：QuickJS engine 拥有图，host 只有一个 normalizer/loader + 静态 `builtins[]` + JS 实现的 import map；构建期 esbuild/qjsc，运行期 lazy bytecode。
-- **Deno**：`deno_core::ModuleMap` 拥有运行时图，CLI `deno_graph` 拥有解析/构建策略；`ModuleId` 下标、`by_name` 索引、独立 `handles` 数组、`RecursiveModuleLoad` 的 futures + 两级 visited 去重，是五者中最工程化的设计。
-- **Node.js**：JS 拥有 ESM 状态机（`ModuleLoader` + `ModuleJob` + `loadCache`），C++ `ModuleWrap` 只做 V8 适配；CJS 是独立同步 loader，通过 synthetic namespace 和 `require(esm)` 桥接。
-
-选择哪一种，本质上是在回答三个问题：
-
-1. **你愿意自己维护 module graph 吗？**
-   - 愿意：dune 路线，控制力最强，但必须自己处理环、TLA、错误传播、缓存失效；
-   - 不愿意：QuickJS 路线，host 只写 resolver/loader；
-   - 中间：Deno 路线，把图放进 core，把策略放进 CLI。
-
-2. **你需要 Node/npm/CJS 生态吗？**
-   - 需要：Node（原生）或 Deno（兼容层）；LLRT 是 Lambda 子集；
-   - 不需要：dune/txiki 的 import map + URL/ESM 更简单。
-
-3. **你希望 builtin 是 ESM 源文件、native module，还是预编译 bytecode？**
-   - ESM 源文件：dune，简单可读但启动慢、依赖需要 ESM 图；
-   - native module：LLRT，快但依赖隐式、初始化顺序敏感；
-   - bytecode：LLRT/txiki，启动快但构建复杂；
-   - extension/snapshot：Deno/Node，统一模型但架构复杂。
-
-对 rsvim 而言，当前是 dune 的静态子集：`ModuleMap` + `fetch_module_tree` + `module_resolve_cb`，没有 `EsModule`/`ModuleGraph`/动态 import。最小演进路径是先把静态图的状态/错误传播补好，再决定是否引入 dune 式动态图或 Deno 式 core 图；在引入之前，dune 的环死锁与 TLA 丢弃是两个必须避开的坑。
+选择方案时，应分别回答：模块如何规范化身份、加载如何并发和去重、何时完成用户 import Promise、是否需要 Node CJS 的同步与部分 exports 语义，以及如何交付 builtin/编译缓存。static import、dynamic import、require 可以复用底层模块，但不能省略各自的 API 合约。§9 给出这三条路径的比较，§10 提供本地 binary 与源码交叉验证的可复现证据。
